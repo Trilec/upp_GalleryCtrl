@@ -41,3 +41,4 @@
 *.dwo
 GalleryCtrl/IconGalleryCtrl - Copy.cpp
 GalleryCtrl/IconGalleryCtrl - Copy.h
+examples/GalleryDemo/snippets.cpp

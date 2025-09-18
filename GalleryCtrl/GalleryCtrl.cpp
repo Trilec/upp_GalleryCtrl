@@ -12,14 +12,9 @@ static unsigned Hash32(const String& s) {
     return h;
 }
 
-static Color BlendAlpha(Color a, Color b, int alpha /*0..255*/) {
-    return Blend(a, b, alpha);
-}
-
-// erase a single value from Vector<int> (no U++ helper needed)
 static void EraseValue(Vector<int>& v, int x) {
     for(int i = 0; i < v.GetCount(); ++i)
-        if(v[i] == x) { v.Remove(i); break; }
+        if(v[i] == x) { v.Remove(i); return; }
 }
 
 // ------------------------- ctor -------------------------
@@ -33,6 +28,11 @@ GalleryCtrl::GalleryCtrl()
 
     BackPaint();
     NoWantFocus();
+
+    // stored defaults for forward features
+    orientation    = Orientation::Vertical;
+    thumb_aspect_w = 16;
+    thumb_aspect_h = 9;
 
     Reflow();
     Refresh();
@@ -58,12 +58,10 @@ void GalleryCtrl::AddDummy(const String& name)
     Add(name, Image(), Null);
 }
 
-bool GalleryCtrl::SetThumbFromFile(int index, const String& filepath)
+bool GalleryCtrl::SetThumbFromFile(int, const String&)
 {
-    if(!IsValidIndex(index))
-        return false;
     // Keep this a stub to avoid decoder dependency here.
-    // Load in the app and call SetThumbImage(...) instead.
+    // Load in the app via plugin/png/etc and call SetThumbImage(...) instead.
     return false;
 }
 
@@ -86,6 +84,14 @@ void GalleryCtrl::ClearThumbImage(int index)
     it.thumb_normal = Null;
     it.thumb_gray   = Null;
     it.status = ThumbStatus::Auto;
+    Refresh();
+}
+
+void GalleryCtrl::Clear()
+{
+    items.Clear();
+    anchor_index = -1;
+    Reflow();
     Refresh();
 }
 
@@ -156,6 +162,47 @@ void GalleryCtrl::SetAspectPolicy(AspectPolicy p)
     Refresh();
 }
 
+// Programmer-friendly sizing facade
+void GalleryCtrl::SetThumbSize(int px)
+{
+    if(zoom_steps.IsEmpty()) return;
+    int best = 0, best_diff = INT_MAX;
+    for(int i = 0; i < zoom_steps.GetCount(); ++i) {
+        int d = abs(zoom_steps[i] - px);
+        if(d < best_diff) { best = i; best_diff = d; }
+    }
+    SetZoomIndex(best);
+}
+
+int GalleryCtrl::GetThumbSize() const
+{
+    return zoom_steps.IsEmpty() ? 0 : zoom_steps[zoom_i];
+}
+
+void GalleryCtrl::SetThumbAspect(int w, int h)
+{
+    // stored only; current renderer uses square tiles
+    thumb_aspect_w = max(1, w);
+    thumb_aspect_h = max(1, h);
+    Refresh();
+}
+
+void GalleryCtrl::SetStackSize(int px)
+{
+    labelH = max(0, px);
+    Reflow();
+    Refresh();
+}
+
+void GalleryCtrl::SetOrientation(Orientation o)
+{
+    if(orientation == o) return;
+    orientation = o;
+    // Baseline renderer is vertical grid; horizontal comes in the next step.
+    Reflow();
+    Refresh();
+}
+
 // ------------------------- geometry & helpers -------------------------
 Rect GalleryCtrl::IndexRectNoScroll(int i) const
 {
@@ -215,7 +262,7 @@ void GalleryCtrl::Reflow()
     content_w = cols * cell_w + pad;
     content_h = rows * cell_h + pad;
 
-    // (Keep ScrollBars hookup minimal; custom wheel/keys adjust scroll_x/y.)
+    // ScrollBars reserved for future hookup (currently using scroll_x/y).
     Refresh();
 }
 
@@ -257,14 +304,10 @@ Image GalleryCtrl::MakeGray(const Image& in) const
 Image GalleryCtrl::MakeFillCropped(const Image& src, int tile, bool gray) const
 {
     if(IsNull(src)) return Image();
-    Size t(tile, tile);
     Size fsz = FillSize(src.GetSize(), tile);
 
-    // Scale first
-    Image scaled = Rescale(src, fsz); // Rescale is U++ image scaler
-
-    if(gray)
-        scaled = MakeGray(scaled);
+    Image scaled = Rescale(src, fsz);
+    if(gray) scaled = MakeGray(scaled);
 
     // Center-crop to tile
     int sx = max(0, (scaled.GetWidth()  - tile) / 2);
@@ -279,25 +322,23 @@ void GalleryCtrl::StrokeRect(Draw& w, const Rect& r, int t, const Color& c)
     for(int i = 0; i < t; ++i) { w.DrawRect(rr, c); rr.Deflate(1); }
 }
 
-
 static Image MakeGlyphGeneric(int tile, void (*fn)(BufferPainter&, int, bool), bool gray)
 {
     ImageBuffer ib(Size(tile, tile));
-    BufferPainter p(ib);
-    p.Begin();                               // <-- required
+    BufferPainter p;
+    p.Create(ib, MODE_ANTIALIASED);
     p.Clear(GrayColor(240));
-    fn(p, tile, gray);                       // does NOT call Begin/End internally
-    p.End();                                 // <-- pairs with Begin
+    fn(p, tile, gray);
+    p.Finish();
     return Image(ib);
 }
 
 void GalleryCtrl::DrawPlaceholderGlyph(BufferPainter& p, int tile, bool gray)
 {
-    Rect r = RectC(0, 0, tile, tile);
-    Color box = gray ? GrayColor(150) : SColorDisabled();
+    Color box  = gray ? GrayColor(150) : SColorDisabled();
     Color plus = gray ? GrayColor(100) : SColorText();
 
-    // dashed box
+    // dashed border
     for(int k = 0; k < tile; ++k) {
         if(k % 4 < 2) {
             p.Rectangle(k, 0, 1, tile).Fill(box);
@@ -315,7 +356,6 @@ void GalleryCtrl::DrawPlaceholderGlyph(BufferPainter& p, int tile, bool gray)
 
 void GalleryCtrl::DrawMissingGlyph(BufferPainter& p, int tile, bool gray)
 {
-    Rect r = RectC(0, 0, tile, tile);
     Color frame = gray ? GrayColor(90) : Color(180, 40, 40);
     Color excl  = gray ? GrayColor(110) : Color(220, 60, 60);
     int t = max(2, tile / 16);
@@ -333,7 +373,6 @@ void GalleryCtrl::DrawMissingGlyph(BufferPainter& p, int tile, bool gray)
 
 void GalleryCtrl::DrawErrorGlyph(BufferPainter& p, int tile, bool gray)
 {
-    Rect r = RectC(0, 0, tile, tile);
     Color frame = gray ? GrayColor(90) : Color(180, 40, 40);
     Color err   = gray ? GrayColor(110) : Color(220, 60, 60);
     int t = max(2, tile / 16);
@@ -344,17 +383,12 @@ void GalleryCtrl::DrawErrorGlyph(BufferPainter& p, int tile, bool gray)
     p.Rectangle(0, 0, t, tile).Fill(frame);
     p.Rectangle(tile - t, 0, t, tile).Fill(frame);
 
-    // X strokes
-    for (int k = 0; k < r.Width(); ++k) {
-        int w  = 1;
-        int x  = r.left + k;
-        int y  = r.top  + k;
-        p.Rectangle(x, y, w, w).Fill(err);
-        int x2 = r.right - k - 1; 
-        p.Rectangle(x2, r.top + k, w, w).Fill(err);
+    // X
+    for (int k = 0; k < tile; ++k) {
+        p.Rectangle(k, k, 1, 1).Fill(err);
+        p.Rectangle(tile - k - 1, k, 1, 1).Fill(err);
     }
 }
-
 
 Image GalleryCtrl::MakePlaceholderGlyph(int tile, bool gray)
 {
@@ -413,14 +447,8 @@ Color GalleryCtrl::AutoColorFromText(const String& s) const
     int H8 = (h & 0xFF);                   // 0..255
     int S8 = 120 + int((h >> 8)  & 0x3F);  // 120..183
     int V8 = 170 + int((h >> 14) & 0x3F);  // 170..233
-
-    double Hn = H8 / 255.0;                // docs: h, s, v all in [0..1]
-    double Sn = S8 / 255.0;
-    double Vn = V8 / 255.0;
-
-    return HsvColorf(Hn, Sn, Vn);          // verified API
+    return HsvColorf(H8 / 255.0, S8 / 255.0, V8 / 255.0);
 }
-
 
 // ------------------------- rendering -------------------------
 void GalleryCtrl::EnsureThumbs(GalleryItem& it)
@@ -449,6 +477,11 @@ void GalleryCtrl::EnsureThumbs(GalleryItem& it)
     it.thumb_gray = MakeGray(it.thumb_normal);
 }
 
+void GalleryCtrl::Layout()
+{
+    Reflow();    // recompute cols/rows/content when size changes
+}
+
 void GalleryCtrl::Paint(Draw& w)
 {
     const Size sz = GetSize();
@@ -469,17 +502,16 @@ void GalleryCtrl::Paint(Draw& w)
     for(int r = y0; r <= y1; ++r) {
         for(int c = 0; c < cc; ++c) {
             const int i = r * cc + c;
-            if(i >= items.GetCount())
-                break;
+            if(i >= items.GetCount()) break;
 
-            Rect rc = IndexRect(i); // on-screen rect (tile+label height)
+            Rect rc     = IndexRect(i);
             Rect img_rc = RectC(rc.left, rc.top, tile, tile);
 
-            // background hover tint
+            // hover tint
             if(hover_enabled && i == hover_index)
                 w.DrawRect(img_rc, Blend(SColorFace(), SColorHighlight(), 32));
 
-            // pick image
+            // image
             auto& it = items[i];
             EnsureThumbs(it);
 
@@ -493,7 +525,6 @@ void GalleryCtrl::Paint(Draw& w)
             else
                 to_draw = it.filtered_out && saturation_on ? it.thumb_gray : it.thumb_normal;
 
-            // center image in tile area
             Size isz = to_draw.GetSize();
             Point ip = img_rc.CenterPos(isz);
             w.DrawImage(RectC(ip.x, ip.y, isz.cx, isz.cy), to_draw);
@@ -504,11 +535,10 @@ void GalleryCtrl::Paint(Draw& w)
             w.DrawRect(lab, lb);
 
             // label text
-            String label = it.name;
             w.DrawText(lab.left + 4, lab.top + (lab.GetHeight() - Draw::GetStdFontCy())/2,
-                       label, StdFont(), SColorText());
+                       it.name, StdFont(), SColorText());
 
-            // small data-flag dot
+            // data-flag dot
             if(it.flags != DF_None) {
                 int d = max(4, tile / 10);
                 Rect dot = RectC(lab.right - d - 4, lab.top + (lab.GetHeight() - d)/2, d, d);
@@ -526,6 +556,17 @@ void GalleryCtrl::Paint(Draw& w)
             }
         }
     }
+
+    // marquee
+	if(dragging && !drag_rect_win.IsEmpty()) {
+	    Rect r = drag_rect_win;
+	    r.Offset(-scroll_x, -scroll_y);
+	    // Draw has no alpha → simulate translucency against face color.
+	    Color fill = Blend(SColorFace(), SColorHighlight(), 64); // subtle tint
+	    w.DrawRect(r, fill);
+	    StrokeRect(w, r, 1, SColorHighlight());                  // 1px ring
+	}
+
 }
 
 // ------------------------- input -------------------------
@@ -539,9 +580,9 @@ void GalleryCtrl::LeftDown(Point p, dword flags)
 
     if(i < 0) {
         // Start marquee on empty space
-        mouse_down     = true;
-        dragging       = false;
-        drag_additive  = ctrl;
+        mouse_down      = true;
+        dragging        = false;
+        drag_additive   = ctrl;
         drag_origin_win = p;
         drag_rect_win   = Rect(p, p);
         drag_prev_sel   = GetSelection();
@@ -559,13 +600,11 @@ void GalleryCtrl::LeftDown(Point p, dword flags)
         next.Clear();
         for(int k = a; k <= b; ++k) next.Add(k);
     }
-	else if(ctrl) {
-	    if(it->selected)
-	        EraseValue(next, i);   // instead of RemoveValue(...)
-	    else
-	        next.Add(i);
-	    anchor_index = i;
-	}
+    else if(ctrl) {
+        if(it->selected) EraseValue(next, i);
+        else             next.Add(i);
+        anchor_index = i;
+    }
     else {
         next.Clear();
         next.Add(i);
@@ -633,7 +672,6 @@ bool GalleryCtrl::Key(dword key, int)
     return false;
 }
 
-
 void GalleryCtrl::MouseWheel(Point, int zdelta, dword keyflags)
 {
     if(keyflags & K_CTRL) {
@@ -648,7 +686,7 @@ void GalleryCtrl::MouseWheel(Point, int zdelta, dword keyflags)
 
 void GalleryCtrl::OnScroll()
 {
-    // Minimal hookup (kept for future ScrollBars integration).
+    // Reserved for future ScrollBars hookup.
     Refresh();
 }
 
@@ -670,8 +708,8 @@ void GalleryCtrl::SelectRange(int a, int b, bool additive)
 
 bool GalleryCtrl::CommitSelection(const Vector<int>& next)
 {
-    Vector<int> before = GetSelection();   // move from return (OK)
-    Vector<int> after; after <<= next;     // deep copy, not move
+    Vector<int> before = GetSelection();
+    Vector<int> after; after <<= next; // deep copy
 
     Sort(before);
     Sort(after);
@@ -697,19 +735,18 @@ bool GalleryCtrl::CommitSelection(const Vector<int>& next)
     return true;
 }
 
-
 void GalleryCtrl::ApplyMarqueeSelection()
 {
     if(drag_rect_win.IsEmpty())
         return;
 
-    Rect selrc = drag_rect_win.Offseted(scroll_x, scroll_y); // convert to content space
+    Rect selrc = drag_rect_win.Offseted(scroll_x, scroll_y); // to content space
     const int tile   = zoom_steps[zoom_i];
     const int cell_w = pad + tile + pad;
     const int cell_h = pad + tile + labelH + pad;
 
     Vector<int> merge;
-       if(drag_additive)  merge <<= drag_prev_sel;   // deep copy previous selection
+    if(drag_additive)  merge <<= drag_prev_sel;
 
     int first_r = max(0, (selrc.top  - pad) / cell_h);
     int last_r  = (selrc.bottom - pad) / cell_h;

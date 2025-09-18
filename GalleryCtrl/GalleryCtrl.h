@@ -30,6 +30,9 @@ enum DataFlags : unsigned {
 
 inline bool HasFlag(DataFlags f, DataFlags m) { return (f & m) != DF_None; }
 
+// Layout orientation (forward-looking; rendering is vertical grid now)
+enum class Orientation { Vertical, Horizontal };
+
 // ---------- Item ----------
 struct GalleryItem : Moveable<GalleryItem> {
     String      name;
@@ -46,10 +49,10 @@ struct GalleryItem : Moveable<GalleryItem> {
 // ---------- Control ----------
 class GalleryCtrl : public Ctrl {
 public:
-    typedef GalleryCtrl CLASSNAME;              // required for THISBACK(...)
+    typedef GalleryCtrl CLASSNAME;
     GalleryCtrl();
 
-    // ---- Events ----
+    // ---- Events (lambdas-ready) ----
     Gate1<const Vector<int>&> WhenSelecting;    // pre-selection veto
     Event<>                   WhenSelection;    // post-selection
     Event<const GalleryItem&> WhenActivate;     // double-click / Enter on item
@@ -61,10 +64,13 @@ public:
     // ---- Items & Images ----
     int   Add(const String& name, const Image& opt_img = Image(), Color tint = Null);
     void  AddDummy(const String& name);
-
-    bool  SetThumbFromFile(int index, const String& filepath); // (stub) returns false if not loaded
+    bool  SetThumbFromFile(int index, const String& filepath); // (stub) returns false
     void  SetThumbImage(int index, const Image& img);
     void  ClearThumbImage(int index);
+
+    // Convenience for demos/tools
+    int   GetCount() const                 { return items.GetCount(); }
+    void  Clear();                         // remove all items (no context menu plumbing)
 
     // ---- Status & Data Flags ----
     void      SetThumbStatus(int index, ThumbStatus s);
@@ -81,9 +87,16 @@ public:
     // ---- Zoom & Aspect ----
     void         SetZoomIndex(int zi);
     int          GetZoomIndex() const { return zoom_i; }
-
     void         SetAspectPolicy(AspectPolicy p);
     AspectPolicy GetAspectPolicy() const { return aspect_policy; }
+
+    // Programmer-friendly sizing facade (maps to current internals)
+    void  SetThumbSize(int px);                 // chooses nearest zoom step
+    int   GetThumbSize() const;                 // current tile size (longest edge)
+    void  SetThumbAspect(int w, int h);         // stored; future renderer use
+    void  SetStackSize(int px);                 // maps to label height in vertical baseline
+    void  SetOrientation(Orientation o);        // stored; rendering vertical for now
+    Orientation GetOrientation() const { return orientation; }
 
     // ---- Visual toggles ----
     void  SetShowSelectionBorders(bool b) { show_selection_border = b; Refresh(); }
@@ -173,7 +186,10 @@ private:
     int          zoom_i     = 0;  // current zoom index (into zoom_steps)
 
     // ---- Policy / toggles ----
-    AspectPolicy aspect_policy       = AspectPolicy::Fit;
+    AspectPolicy aspect_policy         = AspectPolicy::Fit;
+    Orientation  orientation           = Orientation::Vertical; // stored (future)
+    int          thumb_aspect_w        = 1;                     // stored (future)
+    int          thumb_aspect_h        = 1;                     // stored (future)
     bool         show_selection_border = true;
     bool         show_filter_border    = true;
     bool         saturation_on         = true;
@@ -186,13 +202,14 @@ private:
     bool        drag_additive  = false;
     Point       drag_origin_win;
     Rect        drag_rect_win;
-    Vector<int> drag_prev_sel;           // snapshot for additive marquee
+    Vector<int> drag_prev_sel;
 
     int         hover_index    = -1;
     int         anchor_index   = -1;
 
 private:
     // ---- Ctrl overrides ----
+     void   Layout() override;        
     void   Paint(Draw& w) override;
     void   LeftDown(Point p, dword flags) override;
     void   LeftDouble(Point p, dword flags) override;
