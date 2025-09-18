@@ -1,0 +1,13 @@
+description "GalleryCtrl — reusable zoomable thumbnail control\377";
+
+uses
+	Core,
+	CtrlLib;
+
+include
+	.;
+
+file
+	GalleryCtrl.h,
+	GalleryCtrl.cpp;
+

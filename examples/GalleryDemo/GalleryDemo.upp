@@ -1,0 +1,16 @@
+description "GalleryDemo — demo app for GalleryCtrl\377";
+
+uses
+	Core,
+	CtrlLib,
+	GalleryCtrl;
+
+include
+	.;
+
+file
+	main.cpp;
+
+mainconfig
+	"" = "";
+
