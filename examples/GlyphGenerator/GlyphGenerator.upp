@@ -1,0 +1,16 @@
+description "GlyphGenerator — demo app procedural shape generation\377";
+
+uses
+	Core,
+	CtrlLib,
+	GalleryCtrl;
+
+include
+	.;
+
+file
+	main.cpp;
+
+mainconfig
+	"" = "";
+
