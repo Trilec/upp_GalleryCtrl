@@ -1,46 +1,82 @@
+/*
+-------------------------------------------------------------------------------
+ U++ Procedural Icon Builder – Drawing Demo (with future Gallery control)
+-------------------------------------------------------------------------------
+ Purpose
+   • Self‑contained demo showing interactive drawing with BufferPainter.
+   • Users can place/edit Rectangle / Circle / Line / Triangle primitives,
+     tweak styles (fill/stroke/dash/opacity/outline), and export painter code.
+   • Right pane emits a ready‑to‑paste function that draws the current design.
+
+ Build (TheIDE, U++ 2025.1+)
+   Package type: GUI application
+   uses:
+     Core,
+     CtrlLib,
+     Draw,
+     Painter
+   (No image plugins required unless you add raster I/O.)
+
+ Design choices (keep in mind when extending)
+   • All geometry inside Canvas is normalized to the inset rectangle (0..1).
+   • Rendering goes through an abstract Emitter, implemented by PainterEmitter.
+     This keeps path construction testable and decoupled from BufferPainter.
+   • History uses JSON snapshots (ValueMap/ValueArray) – simple and robust.
+   • All GUI work happens on the main thread; callbacks are short and safe.
+
+ Future work (non‑breaking)
+   • Plug‑in a GalleryCtrl on the left; it will simply manipulate Canvas.shapes
+     and call Canvas.Refresh()/WhenModelChanged(). No threading required.
+-------------------------------------------------------------------------------
+*/
+
 #include <CtrlLib/CtrlLib.h>
 #include <Painter/Painter.h>
 #include <Draw/Draw.h>
 
 using namespace Upp;
 
-
 // ===================== Shared model / helpers =====================
 
+// Editing tools available in the UI
 enum class Tool { Cursor, Rect, Circle, Line, Triangle };
 
+// Style of a shape (value type – copied into shapes)
 struct Style : Moveable<Style> {
     Color  fill   = Color(163,201,168);
     Color  stroke = Color(30,53,47);
     int    strokeWidth = 2;
-    bool    evenOdd = false;   // fill rule: true = Even-Odd, false = NonZero
+    bool   evenOdd = false;     // Fill rule: true = Even‑Odd, false = NonZero
 
-    String dash;                 // "" = solid, e.g. "6 4", "2 3", "6 3 2 3"
+    String dash;                // "": solid  e.g. "6 4", "2 3", "6 3 2 3"
 
     bool   enableFill    = true;
     bool   enableStroke  = true;
-    double opacity       = 1.0;
+    double opacity       = 1.0; // 0..1, applied to the painter
 
-    // Outline is an extra contrasting stroke pass
-    bool   outlineEnable = false;
-    Color  outlineColor  = Red();
-    int    outlineWidth  = 0;    // extra width (added to strokeWidth*2)
-    bool   outlineOutside = true;// true => draw outline pass first (looks outside)
+    // Optional outline pass (a contrasting stroke rendered as a separate pass)
+    bool   outlineEnable  = false;
+    Color  outlineColor   = Red();
+    int    outlineWidth   = 0;    // extra width added to (strokeWidth*2)
+    bool   outlineOutside = true; // true => draw outline pass first
 };
 
+// Pixel inset where normalized geometry is mapped
 struct Inset { int x=50, y=50, w=400, h=300; };
 
+// A normalized shape (all geometry in 0..1 relative to inset)
 struct Shape : Moveable<Shape> {
     enum class Type { Rect, Circle, Line, Triangle } type;
     Style  style;
 
     // normalized geometry (0..1)
     double x=0,y=0,w=0,h=0;     // rect
-    double cx=0,cy=0,r=0;       // circle (r is relative to min(width,height))
+    double cx=0,cy=0,r=0;       // circle (r relative to min(width,height))
     Pointf p1, p2, p3;          // line / triangle
-    int    id=0;
+    int    id=0;                // monotonically increasing identifier
 };
 
+// Normalized <-> pixel mapping helpers
 static inline int  X (const Rect& r, double nx) { return r.left + int(r.Width() * nx + 0.5); }
 static inline int  Y (const Rect& r, double ny) { return r.top  + int(r.Height()* ny + 0.5); }
 static inline int  Rr(const Rect& r, double nr) { return int(min(r.Width(), r.Height()) * nr + 0.5); }
@@ -50,18 +86,20 @@ static inline double NY(const Rect& r, int py) { return (py - r.top)   / double(
 
 // ===================== Emitters =====================
 
+// Abstract path/styling emitter – allows swapping BufferPainter with tests
 struct Emitter {
-    virtual void Begin()=0; virtual void End()=0;
-    virtual void Move(Pointf p)=0; virtual void Line(Pointf p)=0;
-    virtual void Quadratic(Pointf p1, Pointf p)=0; virtual void Cubic(Pointf p1, Pointf p2, Pointf p)=0;
+    virtual void Begin()=0;  virtual void End()=0;
+    virtual void Move(Pointf p)=0;  virtual void Line(Pointf p)=0;
+    virtual void Quadratic(Pointf p1, Pointf p)=0;  virtual void Cubic(Pointf p1, Pointf p2, Pointf p)=0;
     virtual void Close()=0;
-    virtual void Fill(Color c)=0; virtual void Stroke(double w, Color c)=0;
+    virtual void Fill(Color c)=0;  virtual void Stroke(double w, Color c)=0;
     virtual void Dash(const String& spec, double phase)=0;
-    virtual void Opacity(double o)=0; virtual void EvenOdd(bool eo)=0;
+    virtual void Opacity(double o)=0;  virtual void EvenOdd(bool eo)=0;
     virtual void Clip()=0;
     virtual ~Emitter(){}
 };
 
+// BufferPainter adapter implementing the Emitter interface
 struct PainterEmitter : Emitter {
     BufferPainter& p;
     PainterEmitter(BufferPainter& p):p(p){}
@@ -78,144 +116,58 @@ struct PainterEmitter : Emitter {
     void Clip() override { p.Clip(); }
 };
 
-// Code emitter (produces readable BufferPainter code)
-struct CodeEmitter : Emitter {
-    String& out;
-    CodeEmitter(String& s):out(s){}
-    void Put(const String& s){ out << s; }
-    void Begin() override { Put("    p.Begin();\n"); }
-    void End()   override { Put("    p.End();\n"); }
-    void Move(Pointf a) override { Put(Format("    p.Move(Pointf(%g, %g));\n", a.x, a.y)); }
-    void Line(Pointf a) override { Put(Format("    p.Line(Pointf(%g, %g));\n", a.x, a.y)); }
-    void Quadratic(Pointf a, Pointf b) override { Put(Format("    p.Quadratic(Pointf(%g,%g), Pointf(%g,%g));\n", a.x,a.y,b.x,b.y)); }
-    void Cubic(Pointf a, Pointf b, Pointf c) override { Put(Format("    p.Cubic(Pointf(%g,%g), Pointf(%g,%g), Pointf(%g,%g));\n", a.x,a.y,b.x,b.y,c.x,c.y)); }
-    void Close() override { Put("    p.Close();\n"); }
-    void Fill(Color c) override { Put(Format("    p.Fill(Color(%d,%d,%d));\n", c.GetR(), c.GetG(), c.GetB())); }
-    void Stroke(double w, Color c) override { Put(Format("    p.Stroke(%g, Color(%d,%d,%d));\n", w, c.GetR(), c.GetG(), c.GetB())); }
-    void Dash(const String& spec, double phase) override { if(!spec.IsEmpty()) Put(Format("    p.Dash(String(\"%s\"), %g);\n", spec.Begin(), phase)); }
-    void Opacity(double o) override { if(o < 1.0) Put(Format("    p.Opacity(%g);\n", o)); }
-    void EvenOdd(bool eo) override { if(eo) Put("    p.EvenOdd(true);\n"); }
-    void Clip() override { Put("    p.Clip();\n"); }
-};
-
-// ===================== Path builders =====================
-
-static void EmitRectPath(Emitter& e, const Rect& r){
-    e.Begin();
-    e.Move(Pointf(r.left, r.top));
-    e.Line(Pointf(r.right, r.top));
-    e.Line(Pointf(r.right, r.bottom));
-    e.Line(Pointf(r.left, r.bottom));
-    e.Close();
-}
-
-// ===================== Shape renderer =====================
-
-static void StylePass(Emitter& e, const Style& st, bool main_pass, bool is_line){
-    if(main_pass){
-        if(st.opacity < 1.0) e.Opacity(st.opacity);
-        if(!st.dash.IsEmpty()) e.Dash(st.dash, 0.0);
-        if(st.enableFill && !is_line) e.Fill(st.fill);
-        if(st.enableStroke)          e.Stroke(st.strokeWidth, st.stroke);
-    } else {
-        // outline
-        if(st.outlineEnable && st.outlineWidth > 0)
-            e.Stroke(st.strokeWidth + 2 * max(0, st.outlineWidth), st.outlineColor);
-    }
-}
-
-static void EmitShape(Emitter& e, const Shape& s, const Rect& inset, bool clip_to_inset) {
-    auto rebuild = [&]{
-        switch(s.type){
-        case Shape::Type::Rect: {
-            Rect r(X(inset, s.x), Y(inset, s.y),
-                   X(inset, s.x + s.w), Y(inset, s.y + s.h));
-            EmitRectPath(e, r);
-            break;
-        }
-        case Shape::Type::Circle: {
-            // For code emitter we still write the path; but painter path is not used for Circle()
-            // We just build a circle path (square approximation is unnecessary for painter; but code stays simple)
-            // We'll just move/line a rectangle bound (not used by painter pass anyway)
-            Rect r = RectC(X(inset, s.cx) - Rr(inset, s.r), Y(inset, s.cy) - Rr(inset, s.r),
-                           2*Rr(inset, s.r), 2*Rr(inset, s.r));
-            EmitRectPath(e, r); // harmless
-            break;
-        }
-        case Shape::Type::Line:
-            e.Begin();
-            e.Move(Pointf(X(inset, s.p1.x), Y(inset, s.p1.y)));
-            e.Line(Pointf(X(inset, s.p2.x), Y(inset, s.p2.y)));
-            break;
-        case Shape::Type::Triangle:
-            e.Begin();
-            e.Move(Pointf(X(inset, s.p1.x), Y(inset, s.p1.y)));
-            e.Line(Pointf(X(inset, s.p2.x), Y(inset, s.p2.y)));
-            e.Line(Pointf(X(inset, s.p3.x), Y(inset, s.p3.y)));
-            e.Close();
-            break;
-        }
-    };
-
-
-    // Outline pass (outside) -> Main pass -> Outline pass (inside)
-    bool is_line = (s.type == Shape::Type::Line);
-
-    if(s.style.outlineEnable && s.style.outlineOutside){
-        rebuild(); StylePass(e, s.style, false, is_line); e.End();
-    }
-    rebuild(); StylePass(e, s.style, true, is_line); e.End();
-
-    if(s.style.outlineEnable && !s.style.outlineOutside){
-        rebuild(); StylePass(e, s.style, false, is_line); e.End();
-    }
-}
+// ===================== Canvas =====================
 
 struct Canvas : public Ctrl {
     typedef Canvas CLASSNAME;
 
-    Vector<Shape> shapes;
+    // Model & state
+    Vector<Shape> shapes;  // back‑to‑front order (last draws on top)
     Style  defaultStyle;
     Inset  inset;
     Tool   tool = Tool::Cursor;
     bool   clip_to_inset = false;
     bool   snap = true;
-    int    grid = 20;
+    int    grid = 20;      // px grid for snapping
 
     // drawing & editing state
     bool   drawing = false;
     int    selected = -1;
-    Point  start;                 // mouse-down in pixels during creation
+    Point  start;                 // mouse‑down in pixels during creation
+
     // editing
     bool   moving = false;        // dragging the whole primitive
-    int    drag_vertex = -1;      // which handle/vertex (-1 = none)
+    int    drag_vertex = -1;      // which handle/vertex (‑1 = none)
     Point  grab_px;               // pixel position at grab
-    // for move
-    double grab_nx = 0, grab_ny = 0;  // normalized mouse grab point (used to keep offset on move)
-    double offx = 0, offy = 0;        // move offset while dragging
+
+    // for move – normalized grab offset to preserve relative position while moving
+    double grab_nx = 0, grab_ny = 0;
 
     // host callbacks
-    Callback WhenModelChanged;
-    Callback WhenSelectionChanged;
+    Callback WhenModelChanged;      // fire on any model mutation
+    Callback WhenSelectionChanged;  // fire when selection changes
 
     Canvas() { NoTransparent(); }
-    
     ~Canvas() {
+        // Clear callbacks to avoid late invocations during teardown
         WhenModelChanged.Clear();
         WhenSelectionChanged.Clear();
     }
 
+    // Current inset rectangle in pixels
     Rect GetInsetRect() const { return RectC(inset.x, inset.y, inset.w, inset.h); }
 
-	static inline int  Snap1D(int v, int origin, int step) {
-	    return origin + ((v - origin + step/2) / step) * step;
-	}
-	static inline Point SnapPt(Point p, const Rect& ir, int step) {
-	    return Point(Snap1D(p.x, ir.left, step),
-	                 Snap1D(p.y, ir.top,  step));
-	}
+    // --------- snapping helpers ---------
+    static inline int  Snap1D(int v, int origin, int step) {
+        // Rounds to the nearest multiple of 'step' relative to 'origin'
+        return origin + ((v - origin + step/2) / step) * step;
+    }
+    static inline Point SnapPt(Point p, const Rect& ir, int step) {
+        return Point(Snap1D(p.x, ir.left, step),
+                     Snap1D(p.y, ir.top,  step));
+    }
 
-    // ---------- path helpers for painter/code preview ----------
+    // ---------- path helpers for painter preview ----------
     static void EmitRectPath(Emitter& e, const Rect& r){
         e.Begin();
         e.Move(Pointf(r.left, r.top));
@@ -224,8 +176,10 @@ struct Canvas : public Ctrl {
         e.Line(Pointf(r.left, r.bottom));
         e.Close();
     }
+
+    // Circle approximated with 4 cubic Beziers (classic kappa method)
     static void EmitCirclePath(Emitter& e, Point c0, int radius) {
-        const double k = 0.5522847498307936;
+        const double k = 0.5522847498307936; // 4*(sqrt(2)-1)/3
         double rx = radius, ry = radius;
         Pointf c(c0);
         Pointf p0 = c + Pointf(0, -ry);
@@ -250,19 +204,22 @@ struct Canvas : public Ctrl {
         e.Close();
     }
 
+    // Style pass (main vs. outline) applied to the *current* path
     static void StylePass(Emitter& e, const Style& st, bool main_pass, bool is_line){
         if(main_pass){
             if(st.opacity < 1.0)         e.Opacity(st.opacity);
-            if(!st.dash.IsEmpty())        e.Dash(st.dash, 0.0);
+            if(!st.dash.IsEmpty())       e.Dash(st.dash, 0.0);
             if(st.enableFill && !is_line) e.Fill(st.fill);
-            if(st.enableStroke)           e.Stroke(st.strokeWidth, st.stroke);
+            if(st.enableStroke)          e.Stroke(st.strokeWidth, st.stroke);
+            if(st.evenOdd)               e.EvenOdd(true);
         } else {
             if(st.outlineEnable && st.outlineWidth > 0)
                 e.Stroke(st.strokeWidth + 2 * max(0, st.outlineWidth), st.outlineColor);
         }
     }
 
-    static void EmitShape(Emitter& e, const Shape& s, const Rect& inset, bool clip_to_inset) {
+    // Build path for a shape and apply style passes (optionally under clip)
+    static void EmitShape(Emitter& e, const Shape& s, const Rect& inset, bool /*clip_to_inset*/) {
         auto rebuild = [&]{
             switch(s.type){
             case Shape::Type::Rect: {
@@ -289,20 +246,19 @@ struct Canvas : public Ctrl {
             }
         };
 
-
-        bool is_line = (s.type == Shape::Type::Line);
+        const bool is_line = (s.type == Shape::Type::Line);
 
         if(s.style.outlineEnable && s.style.outlineOutside){
             rebuild(); StylePass(e, s.style, false, is_line); e.End();
         }
-        rebuild(); StylePass(e, s.style, true, is_line); e.End();
-
+        rebuild(); StylePass(e, s.style, true,  is_line); e.End();
         if(s.style.outlineEnable && !s.style.outlineOutside){
             rebuild(); StylePass(e, s.style, false, is_line); e.End();
         }
     }
 
-    // ---------- hit-testing ----------
+    // ---------- hit‑testing ----------
+    // Returns index of the grabbed handle for the selected shape, or ‑1
     int HitVertex(Point m, int px=6) const {
         if(selected < 0 || selected >= shapes.GetCount()) return -1;
         const Shape& s = shapes[selected];
@@ -334,9 +290,9 @@ struct Canvas : public Ctrl {
         return -1;
     }
 
+    // Body hit (coarse – bounding geometry)
     bool HitBody(Point m) const {
         if(selected < 0 || selected >= shapes.GetCount()) return false;
-        
         const Shape& s = shapes[selected];
         Rect ir = GetInsetRect();
         switch(s.type){
@@ -350,7 +306,7 @@ struct Canvas : public Ctrl {
                 return (m.x-c.x)*(m.x-c.x) + (m.y-c.y)*(m.y-c.y) <= r*r;
             }
             case Shape::Type::Line: {
-                // simple bounding box inflate
+                // Bounding box with padding – good UX and fast
                 int x1=X(ir,s.p1.x), y1=Y(ir,s.p1.y), x2=X(ir,s.p2.x), y2=Y(ir,s.p2.y);
                 return Rect(min(x1,x2),min(y1,y2), max(x1,x2),max(y1,y2)).Inflated(4).Contains(m);
             }
@@ -365,127 +321,126 @@ struct Canvas : public Ctrl {
         }
         return false;
     }
-    
-	void DrawHandle(Draw& w, Point pt, Color c = SColorText()) const {
-	    // outer dark square + inner light square for contrast
-	    w.DrawRect(RectC(pt.x - 4, pt.y - 3, 6, 6), c);
-	    w.DrawRect(RectC(pt.x - 3, pt.y - 2, 4, 4), White());
-	}
+
+    // Draw a single handle (dual‑tone square for contrast)
+    void DrawHandle(Draw& w, Point pt, Color c = SColorText()) const {
+        w.DrawRect(RectC(pt.x - 4, pt.y - 3, 6, 6), c);
+        w.DrawRect(RectC(pt.x - 3, pt.y - 2, 4, 4), White());
+    }
 
     // ---------- painting ----------
-void Paint(Draw& w) override {
-    Size sz = GetSize();
-    w.DrawRect(sz, SColorFace());
-    if(sz.cx <= 2 || sz.cy <= 2) return;
+    void Paint(Draw& w) override {
+        Size sz = GetSize();
+        w.DrawRect(sz, SColorFace());
+        if(sz.cx <= 2 || sz.cy <= 2) return;
 
-    if(shapes.IsEmpty() && selected >= 0)
-        selected = -1;
+        if(shapes.IsEmpty() && selected >= 0)
+            selected = -1;
 
-    const Rect ir = GetInsetRect();
+        const Rect ir = GetInsetRect();
 
-    // background for inset area
-    w.DrawRect(ir, White());
+        // inset background
+        w.DrawRect(ir, White());
 
-    // grid
-    for(int x = ir.left + grid; x < ir.right; x += grid)
-        w.DrawLine(x, ir.top, x, ir.bottom, 1, SColorPaper());
-    for(int y = ir.top + grid; y < ir.bottom; y += grid)
-        w.DrawLine(ir.left, y, ir.right, y, 1, SColorPaper());
+        // grid (light lines)
+        for(int x = ir.left + grid; x < ir.right; x += grid)
+            w.DrawLine(x, ir.top, x, ir.bottom, 1, SColorPaper());
+        for(int y = ir.top + grid; y < ir.bottom; y += grid)
+            w.DrawLine(ir.left, y, ir.right, y, 1, SColorPaper());
 
-    // inset dotted frame
-    for(int i = ir.left; i < ir.right; i += 6)
-        w.DrawLine(i, ir.top, min(i + 3, ir.right), ir.top, 1, SColorHighlight());
-    for(int i = ir.left; i < ir.right; i += 6)
-        w.DrawLine(i, ir.bottom, min(i + 3, ir.right), ir.bottom, 1, SColorHighlight());
-    for(int i = ir.top; i < ir.bottom; i += 6)
-        w.DrawLine(ir.left, i, ir.left, min(i + 3, ir.bottom), 1, SColorHighlight());
-    for(int i = ir.top; i < ir.bottom; i += 6)
-        w.DrawLine(ir.right, i, ir.right, min(i + 3, ir.bottom), 1, SColorHighlight());
+        // inset dotted frame
+        for(int i = ir.left; i < ir.right; i += 6)
+            w.DrawLine(i, ir.top, min(i + 3, ir.right), ir.top, 1, SColorHighlight());
+        for(int i = ir.left; i < ir.right; i += 6)
+            w.DrawLine(i, ir.bottom, min(i + 3, ir.right), ir.bottom, 1, SColorHighlight());
+        for(int i = ir.top; i < ir.bottom; i += 6)
+            w.DrawLine(ir.left, i, ir.left, min(i + 3, ir.bottom), 1, SColorHighlight());
+        for(int i = ir.top; i < ir.bottom; i += 6)
+            w.DrawLine(ir.right, i, ir.right, min(i + 3, ir.bottom), 1, SColorHighlight());
 
-    // ---- painter preview (with optional clip applied ONCE) ----
-    ImageBuffer ib(sz);
-    BufferPainter p(ib);
-    p.Clear(RGBAZero());
+        // ---- painter preview (optional clip applied ONCE) ----
+        ImageBuffer ib(sz);
+        BufferPainter p(ib);
+        p.Clear(RGBAZero());
 
-    // set clip to inset for shapes only
-    if(clip_to_inset) {
-        p.Begin();
-        p.Move(Pointf(ir.left,  ir.top));
-        p.Line(Pointf(ir.right, ir.top));
-        p.Line(Pointf(ir.right, ir.bottom));
-        p.Line(Pointf(ir.left,  ir.bottom));
-        p.Close();
-        p.Clip();              // consume current path as clip; no End() here
+        // Clip to inset so painter drawing respects the white box
+        if(clip_to_inset) {
+            p.Begin();
+            p.Move(Pointf(ir.left,  ir.top));
+            p.Line(Pointf(ir.right, ir.top));
+            p.Line(Pointf(ir.right, ir.bottom));
+            p.Line(Pointf(ir.left,  ir.bottom));
+            p.Close();
+            p.Clip();              // consume current path as clip; no End() here
+        }
+
+        // draw all shapes under the (optional) clip
+        {
+            PainterEmitter pe(p);
+            for(const Shape& s : shapes)
+                EmitShape(pe, s, ir, /*clip_to_inset=*/false);
+        }
+
+        if(clip_to_inset)
+            p.End();           // pop clip
+
+        w.DrawImage(0, 0, Image(ib));
+
+        // ---- selection overlay (NOT clipped) ----
+        if(selected >= 0 && selected < shapes.GetCount()) {
+            const Shape& s = shapes[selected];
+            const Color sel = SColorMark();
+
+            auto Box = [&](Rect r) {
+                w.DrawRect(RectC(r.left, r.top, r.Width(), 1), sel);
+                w.DrawRect(RectC(r.left, r.bottom, r.Width(), 1), sel);
+                w.DrawRect(RectC(r.left, r.top, 1, r.Height()), sel);
+                w.DrawRect(RectC(r.right, r.top, 1, r.Height() + 1), sel);
+            };
+
+            switch(s.type) {
+            case Shape::Type::Rect: {
+                Rect r(X(ir, s.x), Y(ir, s.y),
+                       X(ir, s.x + s.w), Y(ir, s.y + s.h));
+                Box(r);
+                DrawHandle(w, Point(r.left,  r.top));
+                DrawHandle(w, Point(r.right, r.top));
+                DrawHandle(w, Point(r.right, r.bottom));
+                DrawHandle(w, Point(r.left,  r.bottom));
+                break;
+            }
+            case Shape::Type::Circle: {
+                int cx = X(ir, s.cx), cy = Y(ir, s.cy), rr = Rr(ir, s.r);
+                Box(RectC(cx - rr, cy - rr, 2 * rr, 2 * rr));
+                DrawHandle(w, Point(cx, cy));        // center
+                DrawHandle(w, Point(cx + rr, cy));   // radius handle (east)
+                break;
+            }
+            case Shape::Type::Line: {
+                int x1 = X(ir, s.p1.x), y1 = Y(ir, s.p1.y);
+                int x2 = X(ir, s.p2.x), y2 = Y(ir, s.p2.y);
+                w.DrawLine(x1, y1, x2, y2, 1, sel);
+                DrawHandle(w, Point(x1, y1));
+                DrawHandle(w, Point(x2, y2));
+                break;
+            }
+            case Shape::Type::Triangle: {
+                int x1 = X(ir, s.p1.x), y1 = Y(ir, s.p1.y);
+                int x2 = X(ir, s.p2.x), y2 = Y(ir, s.p2.y);
+                int x3 = X(ir, s.p3.x), y3 = Y(ir, s.p3.y);
+                w.DrawLine(x1, y1, x2, y2, 1, sel);
+                w.DrawLine(x2, y2, x3, y3, 1, sel);
+                w.DrawLine(x3, y3, x1, y1, 1, sel);
+                DrawHandle(w, Point(x1, y1));
+                DrawHandle(w, Point(x2, y2));
+                DrawHandle(w, Point(x3, y3));
+                break;
+            }
+            }
+        }
     }
 
-    // draw all shapes under the (optional) clip
-    {
-        PainterEmitter pe(p);
-        for(const Shape& s : shapes)
-            EmitShape(pe, s, ir, /*clip_to_inset=*/false);
-    }
-
-    if(clip_to_inset)
-        p.End();           // pop clip
-
-    w.DrawImage(0, 0, Image(ib));
-
-    // ---- selection overlay (NOT clipped) ----
-    if(selected >= 0 && selected < shapes.GetCount()) {
-        const Shape& s = shapes[selected];
-        const Color sel = SColorMark();
-
-        auto Box = [&](Rect r) {
-            w.DrawRect(RectC(r.left, r.top, r.Width(), 1), sel);
-            w.DrawRect(RectC(r.left, r.bottom, r.Width(), 1), sel);
-            w.DrawRect(RectC(r.left, r.top, 1, r.Height()), sel);
-            w.DrawRect(RectC(r.right, r.top, 1, r.Height() + 1), sel);
-        };
-
-        switch(s.type) {
-        case Shape::Type::Rect: {
-            Rect r(X(ir, s.x), Y(ir, s.y),
-                   X(ir, s.x + s.w), Y(ir, s.y + s.h));
-            Box(r);
-            DrawHandle(w, Point(r.left,  r.top));
-            DrawHandle(w, Point(r.right, r.top));
-            DrawHandle(w, Point(r.right, r.bottom));
-            DrawHandle(w, Point(r.left,  r.bottom));
-            break;
-        }
-        case Shape::Type::Circle: {
-            int cx = X(ir, s.cx), cy = Y(ir, s.cy), rr = Rr(ir, s.r);
-            Box(RectC(cx - rr, cy - rr, 2 * rr, 2 * rr));
-            DrawHandle(w, Point(cx, cy));        // center
-            DrawHandle(w, Point(cx + rr, cy));   // radius handle (east)
-            break;
-        }
-        case Shape::Type::Line: {
-            int x1 = X(ir, s.p1.x), y1 = Y(ir, s.p1.y);
-            int x2 = X(ir, s.p2.x), y2 = Y(ir, s.p2.y);
-            w.DrawLine(x1, y1, x2, y2, 1, sel);
-            DrawHandle(w, Point(x1, y1));
-            DrawHandle(w, Point(x2, y2));
-            break;
-        }
-        case Shape::Type::Triangle: {
-            int x1 = X(ir, s.p1.x), y1 = Y(ir, s.p1.y);
-            int x2 = X(ir, s.p2.x), y2 = Y(ir, s.p2.y);
-            int x3 = X(ir, s.p3.x), y3 = Y(ir, s.p3.y);
-            w.DrawLine(x1, y1, x2, y2, 1, sel);
-            w.DrawLine(x2, y2, x3, y3, 1, sel);
-            w.DrawLine(x3, y3, x1, y1, 1, sel);
-            DrawHandle(w, Point(x1, y1));
-            DrawHandle(w, Point(x2, y2));
-            DrawHandle(w, Point(x3, y3));
-            break;
-        }
-        }
-    }
-}
-
-
-	// ---------- mouse ----------
+    // ---------- mouse ----------
     void LeftDown(Point p, dword) override {
         SetFocus();
         SetCapture();
@@ -494,7 +449,7 @@ void Paint(Draw& w) override {
 
         // Cursor mode: select and start editing (move / vertex drag)
         if(tool == Tool::Cursor) {
-            // pick top-most shape containing point
+            // pick top‑most shape containing point (walk back‑to‑front)
             int best = -1;
             for(int i = shapes.GetCount()-1; i >= 0; --i) {
                 const Shape& s = shapes[i];
@@ -530,13 +485,13 @@ void Paint(Draw& w) override {
                 int hv = HitVertex(p);
                 if(hv >= 0) { drag_vertex = hv; grab_px = p; }
                 else if(HitBody(p)) {
+                    // begin move; remember grab offset so the shape follows naturally
                     moving = true; grab_px = p;
-                    // store where we grabbed (normalized) to keep offset while moving
                     const Shape& s = shapes[selected];
-                    if(s.type == Shape::Type::Rect) { grab_nx = NX(ir, p.x) - s.x; grab_ny = NY(ir, p.y) - s.y; }
+                    if(s.type == Shape::Type::Rect) { grab_nx = NX(ir, p.x) - s.x;  grab_ny = NY(ir, p.y) - s.y; }
                     else if(s.type == Shape::Type::Circle) { grab_nx = NX(ir,p.x) - s.cx; grab_ny = NY(ir,p.y) - s.cy; }
                     else if(s.type == Shape::Type::Line) { grab_nx = NX(ir,p.x) - s.p1.x; grab_ny = NY(ir,p.y) - s.p1.y; }
-                    else { /* triangle */ grab_nx = NX(ir,p.x) - s.p1.x; grab_ny = NY(ir,p.y) - s.p1.y; }
+                    else { /* triangle */             grab_nx = NX(ir,p.x) - s.p1.x; grab_ny = NY(ir,p.y) - s.p1.y; }
                 }
             }
             Refresh();
@@ -544,12 +499,11 @@ void Paint(Draw& w) override {
             return;
         }
 
-        // Create a new primitive (non-cursor tools)
+        // Create a new primitive (non‑cursor tools)
         if(!(tool == Tool::Rect || tool == Tool::Circle || tool == Tool::Line || tool == Tool::Triangle)) return;
         if(!ir.Contains(p)) return;
 
         start = snap ? SnapPt(p, ir, grid) : p;
-
 
         Shape s;
         s.id = shapes.IsEmpty() ? 1 : shapes.Top().id + 1;
@@ -596,16 +550,9 @@ void Paint(Draw& w) override {
 
             if(moving) {
                 double nx, ny;
-                
-				if(snap) {
-					Point sp = SnapPt(p, ir, grid);
-					nx = NX(ir, sp.x);
-					ny = NY(ir, sp.y);
-				} else {
-					nx = NX(ir, p.x);
-					ny = NY(ir, p.y);
-				}
-                
+                if(snap) { Point sp = SnapPt(p, ir, grid); nx = NX(ir, sp.x); ny = NY(ir, sp.y); }
+                else     { nx = NX(ir, p.x);              ny = NY(ir, p.y); }
+
                 if(s.type == Shape::Type::Rect) { s.x = nx - grab_nx; s.y = ny - grab_ny; }
                 else if(s.type == Shape::Type::Circle) { s.cx = nx - grab_nx; s.cy = ny - grab_ny; }
                 else if(s.type == Shape::Type::Line) {
@@ -621,14 +568,14 @@ void Paint(Draw& w) override {
                 Refresh();
                 return;
             }
+
             if(drag_vertex >= 0) {
-                
-                Point pp = snap ? SnapPt(p, ir, grid) : p;
-                 
+                // Apply snapping to vertex/handle edits as well
+                Point sp = snap ? SnapPt(p, ir, grid) : p;
+
                 if(s.type == Shape::Type::Rect) {
-                    
                     // four corners 0..3 TL, TR, BR, BL
-                    double nx = NX(ir, p.x), ny = NY(ir, p.y);
+                    double nx = NX(ir, sp.x), ny = NY(ir, sp.y);
                     double x2 = s.x + s.w, y2 = s.y + s.h;
                     switch(drag_vertex){
                         case 0: s.x = nx; s.y = ny; s.w = x2 - s.x; s.h = y2 - s.y; break;
@@ -637,17 +584,17 @@ void Paint(Draw& w) override {
                         case 3: s.x = nx; s.w = x2 - s.x; s.h = ny - s.y; break;
                     }
                 } else if(s.type == Shape::Type::Circle) {
-                    // drag radius handle on the east
-                    double dx = NX(ir, p.x) - s.cx;
-                    double dy = NY(ir, p.y) - s.cy;
+                    // drag radius handle on the east – keep a circular radius in normalized space
+                    double dx = NX(ir, sp.x) - s.cx;
+                    double dy = NY(ir, sp.y) - s.cy;
                     s.r = sqrt(dx*dx + dy*dy);
                 } else if(s.type == Shape::Type::Line) {
-                    if(drag_vertex == 0) s.p1 = Pointf(NX(ir,p.x), NY(ir,p.y));
-                    else                 s.p2 = Pointf(NX(ir,p.x), NY(ir,p.y));
+                    if(drag_vertex == 0) s.p1 = Pointf(NX(ir, sp.x), NY(ir, sp.y));
+                    else                 s.p2 = Pointf(NX(ir, sp.x), NY(ir, sp.y));
                 } else { // triangle 0..2 = p1..p3
-                    if(drag_vertex == 0) s.p1 = Pointf(NX(ir,p.x), NY(ir,p.y));
-                    if(drag_vertex == 1) s.p2 = Pointf(NX(ir,p.x), NY(ir,p.y));
-                    if(drag_vertex == 2) s.p3 = Pointf(NX(ir,p.x), NY(ir,p.y));
+                    if(drag_vertex == 0) s.p1 = Pointf(NX(ir, sp.x), NY(ir, sp.y));
+                    if(drag_vertex == 1) s.p2 = Pointf(NX(ir, sp.x), NY(ir, sp.y));
+                    if(drag_vertex == 2) s.p3 = Pointf(NX(ir, sp.x), NY(ir, sp.y));
                 }
                 Refresh();
                 return;
@@ -658,13 +605,8 @@ void Paint(Draw& w) override {
         if(!drawing) return;
 
         Shape& s = shapes[selected];
-        
         Point q = snap ? SnapPt(p, ir, grid) : p;
-        
-        if(snap) {
-            q.x = ir.left + ((q.x - ir.left + grid/2) / grid) * grid;
-            q.y = ir.top  + ((q.y - ir.top  + grid/2) / grid) * grid;
-        }
+
         switch(s.type){
         case Shape::Type::Rect: {
             double x0 = NX(ir, start.x);
@@ -687,7 +629,7 @@ void Paint(Draw& w) override {
         case Shape::Type::Triangle: {
             Pointf p1 = s.p1;
             Pointf p2 = Pointf(NX(ir, q.x), NY(ir, q.y));
-            Pointf p3 = Pointf(2*p1.x - p2.x, p2.y);
+            Pointf p3 = Pointf(2*p1.x - p2.x, p2.y); // isosceles base on p1‑p3
             s.p2 = p2; s.p3 = p3;
             break;
         }
@@ -705,16 +647,16 @@ void Paint(Draw& w) override {
     }
 
     // ---------- edit ops ----------
-	void DeleteSelection() {
-	    if(selected >= 0 && selected < shapes.GetCount()){
-	        shapes.Remove(selected);
-	        selected = min(selected, shapes.GetCount() - 1);
-	        Refresh();
-	        // Call synchronously; do NOT PostCallback here (can fire after teardown)
-	        if(WhenModelChanged)        WhenModelChanged();
-	        if(WhenSelectionChanged)    WhenSelectionChanged();
-	    }
-	}
+    void DeleteSelection() {
+        if(selected >= 0 && selected < shapes.GetCount()){
+            shapes.Remove(selected);
+            selected = min(selected, shapes.GetCount() - 1);
+            Refresh();
+            // Call synchronously; do NOT PostCallback here (can fire after teardown)
+            if(WhenModelChanged)        WhenModelChanged();
+            if(WhenSelectionChanged)    WhenSelectionChanged();
+        }
+    }
     void DuplicateSelection() {
         if(selected >= 0 && selected < shapes.GetCount()){
             Shape c = shapes[selected];
@@ -741,7 +683,7 @@ void Paint(Draw& w) override {
             else           s.y = flipy(s.y, cy);
         }
         else if(s.type == Shape::Type::Circle) {
-            // flip about centroid does nothing
+            // flip about centroid does nothing to a circle
         }
         else if(s.type == Shape::Type::Line) {
             double cx = (s.p1.x + s.p2.x)/2.0, cy = (s.p1.y + s.p2.y)/2.0;
@@ -762,12 +704,9 @@ void Paint(Draw& w) override {
     }
 };
 
-
-
-// A simple flow/wrap layout container for buttons.
-// Children are laid out left->right and wrapped when width is insufficient.
-// A simple flow/wrap layout container for buttons.
-// Children are laid out left->right and wrapped when width is insufficient.
+// ===================== WrapPanel (flow layout) =====================
+// A simple flow/wrap layout container for buttons. Children are laid out
+// left‑>right and wrapped when width is insufficient.
 struct WrapPanel : ParentCtrl {
     int row_h = 32;
     int hgap  = 6;
@@ -814,14 +753,13 @@ struct WrapPanel : ParentCtrl {
         cached_gen    = gen;
     }
 
-    // Optional; parent is doing manual layout anyway
+    // A sane minimum: one item wide, one row tall
     Size GetMinSize() const override {
-        // A sane minimum: one item wide, one row tall
         return Size(left_pad + minw_each + right_pad,
                     top_pad + row_h + bottom_pad);
     }
 
-    // Your MainWin calls MeasureHeight(left_w) to stack rows
+    // Ask this from parent to stack rows in a responsive way
     int MeasureHeight(int container_width) const {
         EnsureMeasured(container_width);
         return cached_height;
@@ -845,12 +783,10 @@ struct WrapPanel : ParentCtrl {
             c.LeftPos(x, w).TopPos(y, h);
             x += w + hgap;
         }
-        // No cache invalidation here!
     }
 };
 
-
-
+// ===================== Main window =====================
 struct MainWin : TopWindow {
     typedef MainWin CLASSNAME;
 
@@ -862,19 +798,19 @@ struct MainWin : TopWindow {
     StaticRect rowHead, rowPrims, rowOps,rowActs;
     Label      lblTool;
 
-	// wrap containers for the three rows
-	WrapPanel primsWrap;
-	WrapPanel opsWrap;
-	WrapPanel actWrap;
-	
-	// primitive buttons (owned members)
-	Button bCur, bCirc, bLine, bTri, bRect;
-	
-	// operation buttons (owned members)
-	Button bDelete, btnUndo, btnRedo, btnSaveDes, btnLoadDes;  // <-- updated set
-	
-	// action buttons (owned members)
-	Button bDup, bUp, bDown, bFlipH, bFlipV;
+    // wrap containers for the three rows
+    WrapPanel primsWrap;
+    WrapPanel opsWrap;
+    WrapPanel actWrap;
+
+    // primitive buttons (owned members)
+    Button bCur, bCirc, bLine, bTri, bRect;
+
+    // operation buttons (owned members)
+    Button bDelete, btnUndo, btnRedo, btnSaveDes, btnLoadDes;  // file/history ops
+
+    // action buttons (owned members)
+    Button bDup, bUp, bDown, bFlipH, bFlipV;
 
     // edit panel + canvas
     StaticRect panel;
@@ -896,74 +832,71 @@ struct MainWin : TopWindow {
     DropList     dlLine, dlDash;
     EditString   edDashCustom;
 
-    // labels (default-constructed)
+    // labels
     Label lbStrokeW, lbLine, lbOpacity, lbOutlineW, lbDash;
 
-    // history
+    // history (snapshots of JSON)
     Vector<String> hist;
     int            hipos = -1;
 
-   ~MainWin() {
+    ~MainWin() {
         canvas.WhenModelChanged.Clear();
         canvas.WhenSelectionChanged.Clear();
     }
-    
-    
+
     MainWin() {
         Title("U++ Procedural Icon Builder (WYSIWYG)").Sizeable().Zoomable();
 
         // ------- heading row -------
-lblTool.SetText("Tool: Cursor");
-rowHead.SetFrame(ThinInsetFrame());
-rowHead.Add(lblTool.HCenterPos(300).VCenterPos(22));
+        lblTool.SetText("Tool: Cursor");
+        rowHead.SetFrame(ThinInsetFrame());
+        rowHead.Add(lblTool.HCenterPos(300).VCenterPos(22));
 
-// clip + snap toggles in header (left side)
-optClip.SetLabel("Clip");
-optClip <<= canvas.clip_to_inset;
-optSnap.SetLabel("Snap");
-optSnap <<= canvas.snap;
-optSnap.WhenAction = [=]{
-    canvas.snap = (bool)~optSnap;
-    canvas.Refresh();
-};
+        // clip + snap toggles in header (left side)
+        optClip.SetLabel("Clip");
+        optClip <<= canvas.clip_to_inset;
+        optSnap.SetLabel("Snap");
+        optSnap <<= canvas.snap;
+        optSnap.WhenAction = [=] {
+            canvas.snap = (bool)~optSnap;
+            canvas.Refresh();
+        };
+        rowHead.Add(optClip.LeftPos(6, 70).VCenterPos(22));
+        rowHead.Add(optSnap.LeftPos(80, 70).VCenterPos(22));
 
-rowHead.Add(optClip.LeftPos(6, 70).VCenterPos(22));
-rowHead.Add(optSnap.LeftPos(80, 70).VCenterPos(22));
+        // ------- primitives row -------
+        rowPrims.SetFrame(ThinInsetFrame());
+        rowPrims.Add(primsWrap.SizePos()); // WrapPanel fills the row box
+        primsWrap.Row(32).HGap(8).VGap(8).Padding(8, 4, 8, 4);
 
+        // configure + add primitive buttons
+        bCur.SetLabel("Cursor");     bCur.WhenAction = THISBACK(OnToolCursor);   primsWrap.Add(bCur);
+        bCirc.SetLabel("Circle");    bCirc.WhenAction = THISBACK(OnToolCircle);  primsWrap.Add(bCirc);
+        bLine.SetLabel("Line");      bLine.WhenAction = THISBACK(OnToolLine);    primsWrap.Add(bLine);
+        bTri.SetLabel("Triangle");   bTri.WhenAction = THISBACK(OnToolTriangle); primsWrap.Add(bTri);
+        bRect.SetLabel("Rectangle"); bRect.WhenAction = THISBACK(OnToolRect);    primsWrap.Add(bRect);
 
-// ------- primitives row -------
-rowPrims.SetFrame(ThinInsetFrame());
-rowPrims.Add(primsWrap.SizePos());             // WrapPanel fills the row box
-primsWrap.Row(32).HGap(8).VGap(8).Padding(8,4,8,4);
+        // ------- operations row (file/history ops) -------
+        rowOps.SetFrame(ThinInsetFrame());
+        rowOps.Add(opsWrap.SizePos());
+        opsWrap.Row(32).HGap(8).VGap(8).Padding(8, 4, 8, 4);
 
-// configure + add primitive buttons
-bCur .SetLabel("Cursor");    bCur .WhenAction = THISBACK(OnToolCursor);   primsWrap.Add(bCur);
-bCirc.SetLabel("Circle");    bCirc.WhenAction = THISBACK(OnToolCircle);   primsWrap.Add(bCirc);
-bLine.SetLabel("Line");      bLine.WhenAction = THISBACK(OnToolLine);     primsWrap.Add(bLine);
-bTri .SetLabel("Triangle");  bTri .WhenAction = THISBACK(OnToolTriangle); primsWrap.Add(bTri);
-bRect.SetLabel("Rectangle"); bRect.WhenAction = THISBACK(OnToolRect);     primsWrap.Add(bRect);
+        bDelete.SetLabel("Delete");       bDelete.WhenAction = THISBACK(OnDelete);     opsWrap.Add(bDelete);
+        btnUndo.SetLabel("Undo");         btnUndo.WhenAction = THISBACK(OnUndo);       opsWrap.Add(btnUndo);
+        btnRedo.SetLabel("Redo");         btnRedo.WhenAction = THISBACK(OnRedo);       opsWrap.Add(btnRedo);
+        btnSaveDes.SetLabel("Save Design"); btnSaveDes.WhenAction = THISBACK(SaveDesign); opsWrap.Add(btnSaveDes);
+        btnLoadDes.SetLabel("Load Design"); btnLoadDes.WhenAction = THISBACK(LoadDesign); opsWrap.Add(btnLoadDes);
 
-// ------- operations row (file/history ops) -------
-rowOps.SetFrame(ThinInsetFrame());
-rowOps.Add(opsWrap.SizePos());
-opsWrap.Row(32).HGap(8).VGap(8).Padding(8,4,8,4);
+        // ------- actions row (shape ops) -------
+        rowActs.SetFrame(ThinInsetFrame());
+        rowActs.Add(actWrap.SizePos());
+        actWrap.Row(32).HGap(8).VGap(8).Padding(8, 4, 8, 4);
 
-bDelete  .SetLabel("Delete");      bDelete  .WhenAction = THISBACK(OnDelete);        opsWrap.Add(bDelete);
-btnUndo  .SetLabel("Undo");        btnUndo  .WhenAction = THISBACK(OnUndo);          opsWrap.Add(btnUndo);
-btnRedo  .SetLabel("Redo");        btnRedo  .WhenAction = THISBACK(OnRedo);          opsWrap.Add(btnRedo);
-btnSaveDes.SetLabel("Save Design");btnSaveDes.WhenAction = THISBACK(SaveDesign);     opsWrap.Add(btnSaveDes);
-btnLoadDes.SetLabel("Load Design");btnLoadDes.WhenAction = THISBACK(LoadDesign);     opsWrap.Add(btnLoadDes);
-
-// ------- actions row (shape ops) -------
-rowActs.SetFrame(ThinInsetFrame());
-rowActs.Add(actWrap.SizePos());
-actWrap.Row(32).HGap(8).VGap(8).Padding(8,4,8,4);
-
-bDup  .SetLabel("Duplicate");  bDup  .WhenAction = THISBACK(OnDuplicate);  actWrap.Add(bDup);
-bUp   .SetLabel("Layer-Up");   bUp   .WhenAction = THISBACK(OnLayerUp);    actWrap.Add(bUp);
-bDown .SetLabel("Layer-Down"); bDown .WhenAction = THISBACK(OnLayerDown);  actWrap.Add(bDown);
-bFlipH.SetLabel("Flip H");     bFlipH.WhenAction = THISBACK(OnFlipH);      actWrap.Add(bFlipH);
-bFlipV.SetLabel("Flip V");     bFlipV.WhenAction = THISBACK(OnFlipV);      actWrap.Add(bFlipV);
+        bDup.SetLabel("Duplicate"); bDup.WhenAction = THISBACK(OnDuplicate); actWrap.Add(bDup);
+        bUp.SetLabel("Layer-Up");   bUp.WhenAction = THISBACK(OnLayerUp);   actWrap.Add(bUp);
+        bDown.SetLabel("Layer-Down"); bDown.WhenAction = THISBACK(OnLayerDown); actWrap.Add(bDown);
+        bFlipH.SetLabel("Flip H");  bFlipH.WhenAction = THISBACK(OnFlipH);  actWrap.Add(bFlipH);
+        bFlipV.SetLabel("Flip V");  bFlipV.WhenAction = THISBACK(OnFlipV);  actWrap.Add(bFlipV);
 
         // ------- edit panel -------
         {
@@ -1027,14 +960,13 @@ bFlipV.SetLabel("Flip V");     bFlipV.WhenAction = THISBACK(OnFlipV);      actWr
             panel_pref_h = py + 8;
         }
 
-        // ------- left layout (no clipping) -------
-left.Add(rowHead .HSizePos());               // heights set in Layout()
-left.Add(rowPrims.HSizePos());
-left.Add(rowOps  .HSizePos());
-left.Add(rowActs .HSizePos());
-
-left.Add(panel .HSizePos());                 // heights set in Layout()
-left.Add(canvas.HSizePos());    
+        // ------- left layout (heights are set in Layout()) -------
+        left.Add(rowHead.HSizePos());
+        left.Add(rowPrims.HSizePos());
+        left.Add(rowOps.HSizePos());
+        left.Add(rowActs.HSizePos());
+        left.Add(panel.HSizePos());
+        left.Add(canvas.HSizePos());
 
         // ------- right header + code -------
         lFunc.SetText("Function:");
@@ -1053,34 +985,33 @@ left.Add(canvas.HSizePos());
         code.SetReadOnly();
         right.Add(code.HSizePos().VSizePos(36, 0));
 
-
         // splitter
         hsplit.Horz(left, right);
         Add(hsplit.SizePos());
 
-        // ------- wiring (no captured lambdas) -------
-        dlDash.WhenAction      = THISBACK(OnDashChanged);
-        optFill.WhenAction     = THISBACK(OnStyleChanged);
-        fillClr.WhenAction     = THISBACK(OnStyleChanged);
-        optStroke.WhenAction   = THISBACK(OnStyleChanged);
-        strokeClr.WhenAction   = THISBACK(OnStyleChanged);
-        spWidth.WhenAction     = THISBACK(OnStyleChanged);
-        dlLine.WhenAction      = THISBACK(OnStyleChanged);
-        optEvenOdd.WhenAction  = THISBACK(OnStyleChanged);
-        sOpacity.WhenAction    = THISBACK(OnStyleChanged);
-        optOutline.WhenAction  = THISBACK(OnStyleChanged);
-        outlineClr.WhenAction  = THISBACK(OnStyleChanged);
-        spOutlineW.WhenAction  = THISBACK(OnStyleChanged);
-        edDashCustom.WhenAction= THISBACK(OnStyleChanged);
-optClip.WhenAction = THISBACK(OnTogglesChanged);
-optSnap.WhenAction = THISBACK(OnTogglesChanged);
+        // ------- wiring (THISBACK, no untracked captures) -------
+        dlDash.WhenAction = THISBACK(OnDashChanged);
+        optFill.WhenAction = THISBACK(OnStyleChanged);
+        fillClr.WhenAction = THISBACK(OnStyleChanged);
+        optStroke.WhenAction = THISBACK(OnStyleChanged);
+        strokeClr.WhenAction = THISBACK(OnStyleChanged);
+        spWidth.WhenAction = THISBACK(OnStyleChanged);
+        dlLine.WhenAction = THISBACK(OnStyleChanged);
+        optEvenOdd.WhenAction = THISBACK(OnStyleChanged);
+        sOpacity.WhenAction = THISBACK(OnStyleChanged);
+        optOutline.WhenAction = THISBACK(OnStyleChanged);
+        outlineClr.WhenAction = THISBACK(OnStyleChanged);
+        spOutlineW.WhenAction = THISBACK(OnStyleChanged);
+        edDashCustom.WhenAction = THISBACK(OnStyleChanged);
+        optClip.WhenAction = THISBACK(OnTogglesChanged);
+        optSnap.WhenAction = THISBACK(OnTogglesChanged);
 
-        btnCopy  .WhenAction = THISBACK(OnCopyCode);
-        btnSaveCpp.WhenAction= THISBACK(OnSaveCpp);
-        btnClear .WhenAction = THISBACK(OnClearAll);
+        btnCopy.WhenAction = THISBACK(OnCopyCode);
+        btnSaveCpp.WhenAction = THISBACK(OnSaveCpp);
+        btnClear.WhenAction = THISBACK(OnClearAll);
 
         canvas.WhenSelectionChanged = THISBACK(OnSelectionChanged);
-        canvas.WhenModelChanged     = THISBACK(ModelChanged);
+        canvas.WhenModelChanged = THISBACK(ModelChanged);
 
         LoadUIFrom(canvas.defaultStyle);
         UpdateToolHeading();
@@ -1089,33 +1020,33 @@ optSnap.WhenAction = THISBACK(OnTogglesChanged);
     }
 
     // ---------- layout ----------
-void Layout() override {
-    TopWindow::Layout();
+    void Layout() override {
+        TopWindow::Layout();
 
-    // Figure out how wide the left pane is right now
-    int left_w = left.GetSize().cx;
-    if(left_w <= 0) return;
+        // Current width of the left pane
+        int left_w = left.GetSize().cx;
+        if(left_w <= 0) return;
 
-    // Fixed header height
-    const int hHead = 28;
+        // Fixed header height
+        const int hHead = 28;
 
-    // Ask each WrapPanel how tall it wants to be for this width
-    int hPrims = primsWrap.MeasureHeight(left_w);
-    int hOps   = opsWrap  .MeasureHeight(left_w);
-    int hActs  = actWrap  .MeasureHeight(left_w);
+        // Each WrapPanel returns the height it needs at this width
+        int hPrims = primsWrap.MeasureHeight(left_w);
+        int hOps   = opsWrap  .MeasureHeight(left_w);
+        int hActs  = actWrap  .MeasureHeight(left_w);
 
-    int y = 0;
-    rowHead.TopPos(y, hHead);      y += hHead;
-    rowPrims.TopPos(y, hPrims);    y += hPrims;
-    rowOps  .TopPos(y, hOps);      y += hOps;
-    rowActs .TopPos(y, hActs);     y += hActs;
+        int y = 0;
+        rowHead.TopPos(y, hHead);      y += hHead;
+        rowPrims.TopPos(y, hPrims);    y += hPrims;
+        rowOps  .TopPos(y, hOps);      y += hOps;
+        rowActs .TopPos(y, hActs);     y += hActs;
 
-    // Style panel keeps its preferred height
-    panel.TopPos(y, panel_pref_h); y += panel_pref_h + 12;
+        // Style panel keeps its preferred height
+        panel.TopPos(y, panel_pref_h); y += panel_pref_h + 12;
 
-    // Canvas fills the rest
-    canvas.VSizePos(y, 0);
-}
+        // Canvas fills the rest
+        canvas.VSizePos(y, 0);
+    }
 
     // ---------- handlers ----------
     void OnToolCursor()   { canvas.tool = ::Tool::Cursor;   UpdateToolHeading(); }
@@ -1130,16 +1061,15 @@ void Layout() override {
     void OnLayerDown() { canvas.LayerDown();         RefreshCode(); }
     void OnFlipH()     { canvas.FlipSelection(true);  RefreshCode(); }
     void OnFlipV()     { canvas.FlipSelection(false); RefreshCode(); }
-    void OnUndo() { Undo(); RefreshCode(); }
+    void OnUndo()      { Undo(); RefreshCode(); }
+    void OnRedo()      { Redo(); RefreshCode(); }
 
-void OnRedo() { Redo(); RefreshCode(); }
-
-void OnTogglesChanged() {
-    canvas.clip_to_inset = (bool)~optClip;
-    canvas.snap          = (bool)~optSnap;
-    canvas.Refresh();
-    RefreshCode();
-}
+    void OnTogglesChanged() {
+        canvas.clip_to_inset = (bool)~optClip;
+        canvas.snap          = (bool)~optSnap;
+        canvas.Refresh();
+        RefreshCode();
+    }
 
     void OnDashChanged() {
         edDashCustom.Show(dlDash.GetIndex() == 3);
@@ -1148,9 +1078,7 @@ void OnTogglesChanged() {
     void OnStyleChanged() {
         ApplyStyleToSelectionOrDefaults(false);
     }
-    void OnCopyCode() {
-        WriteClipboardText(code.Get());
-    }
+    void OnCopyCode() { WriteClipboardText(code.Get()); }
     void OnSaveCpp() {
         FileSel fs; fs.Type("C++ file","*.cpp");
         if(fs.ExecuteSaveAs("Save generated .cpp"))
@@ -1174,10 +1102,10 @@ void OnTogglesChanged() {
         RefreshCode();
     }
 
-	void ModelChanged() {
-	    RefreshCode();
-	    PushHistory();
-	}
+    void ModelChanged() {
+        RefreshCode();
+        PushHistory();
+    }
 
     void UpdateToolHeading() {
         String t = "Tool: ";
@@ -1198,6 +1126,7 @@ void OnTogglesChanged() {
         lblTool.SetText(t);
     }
 
+    // Read current UI widgets into a Style and apply to selection or defaults
     void ApplyStyleToSelectionOrDefaults(bool push_hist) {
         ::Style st = canvas.defaultStyle;
 
@@ -1233,6 +1162,7 @@ void OnTogglesChanged() {
         if(push_hist && canvas.WhenModelChanged) canvas.WhenModelChanged();
     }
 
+    // Push a Style into the UI widgets
     void LoadUIFrom(const ::Style& st) {
         optFill    <<= st.enableFill;
         fillClr    .SetData(st.fill);
@@ -1255,6 +1185,7 @@ void OnTogglesChanged() {
         spOutlineW <<= max(st.outlineWidth, 0);
     }
 
+    // Regenerate painter code for the right pane (pure string builder)
     void RefreshCode() {
         String out;
         const String func = Nvl(edFunc.GetText(), "DrawMyIcon");
@@ -1303,6 +1234,8 @@ void OnTogglesChanged() {
                 if(st.enableStroke)
                     out << Format("    p.Stroke(%d, Color(%d,%d,%d));\n",
                                   st.strokeWidth, st.stroke.GetR(), st.stroke.GetG(), st.stroke.GetB());
+                if(st.evenOdd)
+                    out << "    p.EvenOdd(true);\n";
             } else {
                 if(st.outlineEnable && st.outlineWidth > 0)
                     out << Format("    p.Stroke(%d, Color(%d,%d,%d));\n",
@@ -1373,7 +1306,7 @@ void OnTogglesChanged() {
             PushHistory();
     }
 
-    // ---------- JSON ----------
+    // ---------- JSON (round‑trippable; stable for history) ----------
     static String ColorToString(Color c) { return Format("#%02X%02X%02X", c.GetR(), c.GetG(), c.GetB()); }
     static Color  StringToColor(const String& s) {
         if(s.GetCount()==7 && s[0]=='#') {
@@ -1396,8 +1329,8 @@ void OnTogglesChanged() {
         for(const Shape& s : canvas.shapes){
             ValueMap m;
             m("type") = (s.type == Shape::Type::Rect ? "rect" :
-                        s.type == Shape::Type::Circle ? "circle" :
-                        s.type == Shape::Type::Line ? "line" : "triangle");
+                         s.type == Shape::Type::Circle ? "circle" :
+                         s.type == Shape::Type::Line ? "line" : "triangle");
 
             ValueMap st;
             st("fill")           = ColorToString(s.style.fill);
@@ -1492,9 +1425,9 @@ void OnTogglesChanged() {
     }
 };
 
+// ===================== Entry point =====================
 GUI_APP_MAIN {
     SetLanguage(GetSystemLNG());
     MainWin win;
     win.Run();                // window and all children die at the end of this scope
-
 }
