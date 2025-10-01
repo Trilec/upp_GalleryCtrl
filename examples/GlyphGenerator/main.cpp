@@ -35,9 +35,10 @@ using namespace Upp;
 
 enum class LineStyle { Solid, LongDash, ShortDash, Dotted };
 
+
 struct Style : Moveable<Style> {
-    Color  fill        = Color(163, 201, 168);
-    Color  stroke      = Color(30, 53, 47);
+    Color  fill        = Color(168, 168, 168);
+    Color  stroke      = Color(53, 53, 53);
     int    strokeWidth = 2;
     bool   evenOdd     = false;
     String dash;               // freeform "a,b,a,b,..."
@@ -79,6 +80,15 @@ static inline LineStyle FromI(int i) {
     }
 }
 
+static inline LineStyle GuessStyleFromString(const String& s) {
+    if(s.IsEmpty()) return LineStyle::Solid;
+    if(s == "12,4") return LineStyle::LongDash;
+    if(s == "8,4")  return LineStyle::ShortDash;
+    if(s == "2,4")  return LineStyle::Dotted;
+    return LineStyle::Solid; // treat unknown as custom-solid (dash string still applied)
+}
+
+
 enum class Tool  { Cursor, CreateShape };
 enum class PType { Rect, Circle, Line, Triangle, Curve, Text };
 
@@ -117,6 +127,8 @@ struct Shape : Moveable<Shape> {
 
     // Rect
     double x=0, y=0, w=0, h=0;
+    double rxN=0.0, ryN=0.0;  // corner radii,
+    
     // Circle
     double cx=0, cy=0, r=0;               // r relative to min(inset w,h)
     // Line / Triangle
@@ -177,20 +189,42 @@ static inline String DashFrom(LineStyle ls, const String& custom) {
     }
 }
 
-// Value helpers for permissive JSON import forms
-static inline bool IsPairArrayValueMap(const Value& v) {
-    return IsValueArray(v) && !ValueArray(v).IsEmpty() &&
-           IsValueMap(ValueArray(v)[0]) &&
-           ValueMap(ValueArray(v)[0]).Find("key") >= 0;
+// ---------------------- JSON helpers (file-scope) ---------------------------
+static inline bool IsPairArrayValueMap(const Upp::Value& v) {
+    if(!IsValueArray(v)) return false;
+    const ValueArray a = v;
+    if(a.IsEmpty()) return false;
+    const Value& e = a[0];
+    if(!IsValueMap(e)) return false;
+    const ValueMap m = e;
+    return m.Find("key") >= 0 && m.Find("value") >= 0;
 }
-static ValueMap PairArrayToMap(const ValueArray& a) {
+
+static Upp::ValueMap PairArrayToMap(const Upp::ValueArray& a) {
     ValueMap m;
     for(const Value& e : a) {
         if(!IsValueMap(e)) continue;
-        ValueMap kv = e;
+        const ValueMap kv = e;
+        if(kv.Find("key") < 0 || kv.Find("value") < 0) continue;
         const Value key = kv["key"];
         const Value val = kv["value"];
-        m.Add(key, val); // mutation via Add (operator[] returns const Value)
+        // Allow both {"key": "snap", "value": true} and {"key": {"value":"snap"}, ...}
+        String skey;
+        if(IsString(key)) skey = (String)key;
+        else if(IsValueMap(key) && ValueMap(key).Find("value") >= 0 && IsString(ValueMap(key)["value"]))
+            skey = (String)ValueMap(key)["value"];
+        else
+            continue;
+        // If "value" is a nested pair-array ValueMap, flatten one level:
+        if(IsValueMap(val)) {
+            const ValueMap vm = val;
+            if(vm.Find("value") >= 0)
+                m.Add(skey, vm["value"]);
+            else
+                m.Add(skey, val);
+        } else {
+            m.Add(skey, val);
+        }
     }
     return m;
 }
@@ -312,7 +346,7 @@ static constexpr int MIN_EMIT_PX = 6;
 static constexpr int HANDLE_PX   = 9;
 
 // ============================================================================
-// RECT
+// RECT 
 // ============================================================================
 
 static void Rect_EmitPainter(BufferPainter& p, const Rect& inset, const Shape& s) {
@@ -322,13 +356,24 @@ static void Rect_EmitPainter(BufferPainter& p, const Rect& inset, const Shape& s
     r.Normalize();
     if(r.Width() < MIN_EMIT_PX || r.Height() < MIN_EMIT_PX) return;
 
+    // Convert normalized radii to px and clamp to half-edges
+    int rx = min(R(inset, s.rxN), r.Width()  / 2);
+    int ry = min(R(inset, s.ryN), r.Height() / 2);
+
     const Style& st = s.style;
+
     auto Path = [&] {
-        p.Move(Pointf(r.left, r.top));
-        p.Line(Pointf(r.right, r.top));
-        p.Line(Pointf(r.right, r.bottom));
-        p.Line(Pointf(r.left, r.bottom));
-        p.Close();
+        if(rx > 0 || ry > 0) {
+            // Rounded rect
+            p.RoundedRectangle(r.left, r.top, r.Width(), r.Height(), rx, ry);
+        } else {
+            // Sharp rect
+            p.Move(Pointf(r.left, r.top));
+            p.Line(Pointf(r.right, r.top));
+            p.Line(Pointf(r.right, r.bottom));
+            p.Line(Pointf(r.left, r.bottom));
+            p.Close();
+        }
     };
 
     if(st.outlineEnable && st.outlineOutside) Pass_Outline(p, [&]{ p.Begin(); Path(); p.End(); }, st);
@@ -336,6 +381,7 @@ static void Rect_EmitPainter(BufferPainter& p, const Rect& inset, const Shape& s
     Pass_Stroke(p, [&]{ p.Begin(); Path(); p.End(); }, st);
     if(st.outlineEnable && !st.outlineOutside) Pass_Outline(p, [&]{ p.Begin(); Path(); p.End(); }, st);
 }
+
 
 static bool Rect_HitBody(const Rect& inset, const Shape& s, Point m) {
     Rect r = RectC(X(inset, s.x), Y(inset, s.y),
@@ -409,19 +455,31 @@ static void Rect_DragEdit(Shape& s, const Rect& inset, Point cur, bool snap, int
 }
 
 static void Rect_EmitCode(String& out, const Shape& s) {
+    const bool rounded = (s.rxN > 0.0 || s.ryN > 0.0);
     out << "    // Rect\n    p.Begin();\n";
-    out << Format(
-        "    p.Move(Pointf(X(inset,%s),Y(inset,%s))); "
-        "p.Line(Pointf(X(inset,%s),Y(inset,%s))); "
-        "p.Line(Pointf(X(inset,%s),Y(inset,%s))); "
-        "p.Line(Pointf(X(inset,%s),Y(inset,%s))); p.Close();\n",
-        Decimal4(s.x), Decimal4(s.y),
-        Decimal4(s.x + s.w), Decimal4(s.y),
-        Decimal4(s.x + s.w), Decimal4(s.y + s.h),
-        Decimal4(s.x),       Decimal4(s.y + s.h)
-    );
-    if(s.style.opacity < 1.0) out << Format("    p.Opacity(%.3f);\n", Upp::clamp(s.style.opacity, 0.0, 1.0));
-    if(!s.style.dash.IsEmpty()) out << Format("    p.Dash(String(\"%s\"),0.0);\n", ~s.style.dash);
+    if(rounded) {
+        out << "    p.RoundedRectangle("
+            << "X(inset,"<<Decimal4(s.x)<<"), "
+            << "Y(inset,"<<Decimal4(s.y)<<"), "
+            << "X(inset,"<<Decimal4(s.x+s.w)<<")-X(inset,"<<Decimal4(s.x)<<"), "
+            << "Y(inset,"<<Decimal4(s.y+s.h)<<")-Y(inset,"<<Decimal4(s.y)<<"), "
+            << "min(R(inset,"<<Decimal4(s.rxN)<<"), (X(inset,"<<Decimal4(s.x+s.w)<<")-X(inset,"<<Decimal4(s.x)<<"))/2), "
+            << "min(R(inset,"<<Decimal4(s.ryN)<<"), (Y(inset,"<<Decimal4(s.y+s.h)<<")-Y(inset,"<<Decimal4(s.y)<<"))/2)"
+            << ");\n";
+    } else {
+        out << Format(
+            "    p.Move(Pointf(X(inset,%s),Y(inset,%s))); "
+            "p.Line(Pointf(X(inset,%s),Y(inset,%s))); "
+            "p.Line(Pointf(X(inset,%s),Y(inset,%s))); "
+            "p.Line(Pointf(X(inset,%s),Y(inset,%s))); p.Close();\n",
+            Decimal4(s.x), Decimal4(s.y),
+            Decimal4(s.x + s.w), Decimal4(s.y),
+            Decimal4(s.x + s.w), Decimal4(s.y + s.h),
+            Decimal4(s.x),       Decimal4(s.y + s.h)
+        );
+    }
+    EmitOpacityCode(out, s.style.opacity);
+    EmitDashCode(out, s.style.strokeStyle, s.style.dash);
     if(s.style.evenOdd) out << "    p.EvenOdd(true);\n";
     if(s.style.enableFill)
         out << Format("    p.Fill(Color(%d,%d,%d));\n", s.style.fill.GetR(), s.style.fill.GetG(), s.style.fill.GetB());
@@ -430,6 +488,7 @@ static void Rect_EmitCode(String& out, const Shape& s) {
                       s.style.stroke.GetR(), s.style.stroke.GetG(), s.style.stroke.GetB());
     out << "    p.End();\n\n";
 }
+
 
 // ============================================================================
 // CIRCLE
@@ -1111,6 +1170,7 @@ struct Canvas : Ctrl {
     bool   clip = true;
     int    grid = 8;
 
+
     // Clip/aspect
     struct Aspect { int w, h; const char* label; };
     inline static constexpr Aspect ASPECTS[] = {
@@ -1121,7 +1181,9 @@ struct Canvas : Ctrl {
     int    aspect_ix    = 0;      // default 1:1
     double clip_scale_n = 0.80;   // clip rect vs canvas
     Color  bg_color     = SColorFace();
+    bool   bg_enabled = false;
     int    sample_width = 128;
+    int    export_width = 256;
 
     // Drag state
     bool   creating = false;
@@ -1185,66 +1247,121 @@ struct Canvas : Ctrl {
     Canvas() {
         snap = true; clip = true; grid = 8;
         aspect_ix = 0; clip_scale_n = 0.80;
-        bg_color = SColorFace(); sample_width = 128;
+        bg_color = SColorFace();
+        sample_width = 64;
+        export_width = 256;
         text_template = "Text";
     }
 
     // ============================ Painting ===================================
-    void Paint(Draw& w) override {
-        const Size sz = GetSize();
-        w.DrawRect(sz, bg_color);
+void Paint(Draw& w) override
+{
+    const Size sz = GetSize();
+    const Rect ir = GetInsetRect();
 
-        const Rect ir = GetInsetRect();
+    // Fill window background (UI chrome)
+    w.DrawRect(sz, SColorFace());
 
-        // Offscreen layer (opaque) — cheap double-buffering
-        ImageBuffer ib(sz);
+    // ------------------------ 1) Render INSET ONLY (once) ------------------------
+    Image inset_img;
+    {
+        const Size isz = ir.GetSize();
+        ImageBuffer ib(isz);
         ib.SetKind(IMAGE_OPAQUE);
+
         BufferPainter p(ib, MODE_ANTIALIASED);
-        p.Clear(bg_color);
+        p.Clear(bg_enabled ? bg_color : White());
 
-        // Inset design area
-        p.DrawRect(ir, White());
+        // Local inset in offscreen coordinates (0,0..w,h)
+        const Rect lir = RectC(0, 0, isz.cx, isz.cy);
 
-        // Grid under shapes (not clipped)
+        // Grid (drawn in the inset image)
         if(show_grid && grid > 0) {
             const Color gc = Color(200, 230, 230);
-            for(int x = ir.left + grid; x < ir.right; x += grid)
-                p.DrawRect(RectC(x, ir.top, 1, ir.Height()), gc);
-            for(int y = ir.top + grid; y < ir.bottom; y += grid)
-                p.DrawRect(RectC(ir.left, y, ir.Width(), 1), gc);
+            for(int x = grid; x < lir.right; x += grid)
+                p.DrawRect(RectC(x, lir.top, 1, lir.Height()), gc);
+            for(int y = grid; y < lir.bottom; y += grid)
+                p.DrawRect(RectC(lir.left, y, lir.Width(), 1), gc);
         }
 
-        // Optional clip
+        // Optional clip (redundant here but keeps semantics identical)
         if(clip) {
             p.Begin();
-            p.Move(Pointf(ir.left, ir.top));
-            p.Line(Pointf(ir.right, ir.top));
-            p.Line(Pointf(ir.right, ir.bottom));
-            p.Line(Pointf(ir.left, ir.bottom));
+            p.Move(Pointf(lir.left, lir.top));
+            p.Line(Pointf(lir.right, lir.top));
+            p.Line(Pointf(lir.right, lir.bottom));
+            p.Line(Pointf(lir.left, lir.bottom));
             p.Close();
-            p.Clip();     // keep clip active
+            p.Clip();
         }
 
-        // Shapes
+        // Shapes (EmitPainter uses the provided inset; here it’s (0,0..w,h))
         for(const Shape& s : shapes)
-            GetOps(s.type).EmitPainter(p, ir, s);
+            GetOps(s.type).EmitPainter(p, lir, s);
 
-        if(clip) p.End(); // pop clip
+        if(clip) p.End();
 
-        // Blit
-        w.DrawImage(0, 0, Image(ib));
-
-        // Overlay selected (never clipped)
-        if(selected >= 0 && selected < shapes.GetCount())
-            GetOps(shapes[selected].type).DrawOverlay(w, ir, shapes[selected]);
-
-        // Clip frame (always visible)
-        const Color frame = SColorMark();
-        w.DrawRect(RectC(ir.left,  ir.top,    ir.Width(), 1), frame);
-        w.DrawRect(RectC(ir.left,  ir.bottom, ir.Width(), 1), frame);
-        w.DrawRect(RectC(ir.left,  ir.top,    1,           ir.Height()), frame);
-        w.DrawRect(RectC(ir.right, ir.top,    1,           ir.Height()+1), frame);
+        inset_img = Image(ib);
     }
+
+    // ------------------------ 2) Blit inset to window ------------------------
+    w.DrawImage(ir.left, ir.top, inset_img);
+
+    // ------------------------ 3) Overlays (never clipped) --------------------
+    if(selected >= 0 && selected < shapes.GetCount())
+        GetOps(shapes[selected].type).DrawOverlay(w, ir, shapes[selected]);
+
+    // Clip frame (always visible)
+    const Color frame = SColorMark();
+    w.DrawRect(RectC(ir.left,  ir.top,    ir.Width(), 1), frame);
+    w.DrawRect(RectC(ir.left,  ir.bottom, ir.Width(), 1), frame);
+    w.DrawRect(RectC(ir.left,  ir.top,    1,          ir.Height()), frame);
+    w.DrawRect(RectC(ir.right, ir.top,    1,          ir.Height()+1), frame);
+    
+     const String excap = Format("Export [%d]", export_width);
+        Font f = StdFont().Height(9);
+        const Size capsz = GetTextSize(excap, f);
+        int tx = ir.left + (ir.Width() - capsz.cx) / 2;
+        int ty = ir.top - capsz.cy - 2;
+        if(ty < 0) ty = ir.bottom + 2;
+        w.DrawText(tx, ty, excap, f, SColorText());
+
+    // ------------------------ 4) WYSIWYG Preview (reuse inset_img) -----------
+    if(sample_width > 0) {
+        // Target preview size from current aspect
+        const Aspect a = ASPECTS[Upp::clamp(aspect_ix, 0, ASPECT_COUNT - 1)];
+        const double ar = double(a.w) / double(a.h);
+        const int tw = sample_width;
+        const int th = max(1, int(tw / ar + 0.5));
+
+        // Position: left of inset → above inset → top-left fallback
+        const int pad = 8;
+        Point pos(ir.left - pad - tw, ir.top);
+        if(pos.x < pad) { pos.x = ir.left; pos.y = ir.top - pad - th; }
+        if(pos.y < pad) { pos.x = pad; pos.y = pad; }
+
+        const Rect box = RectC(pos.x, pos.y, tw, th);
+
+        // High-quality downscale from the *already rendered* inset
+        Image preview = Rescale(inset_img, Size(tw, th)); // bilinear; fast & decent
+
+        // Caption (small, centered)
+        const String cap = Format("Preview [%d]", sample_width);
+        Font f = StdFont().Height(9);
+        const Size capsz = GetTextSize(cap, f);
+        int tx = box.left + (box.Width() - capsz.cx) / 2;
+        int ty = box.top - capsz.cy - 2;
+        if(ty < 0) ty = box.bottom + 2;
+
+        w.DrawText(tx, ty, cap, f, SColorText());
+
+        // Thin border + image
+        w.DrawRect(box, White());
+        w.DrawRect(box.Inflated(1), SColorShadow());
+        w.DrawImage(box.left, box.top, preview);
+    }
+}
+
 
     // ============================ Mouse ======================================
     void LeftDown(Point p, dword) override {
@@ -1461,6 +1578,55 @@ struct Canvas : Ctrl {
     static inline bool   VB(ValueMap m, const char* k, bool def) { Value v = m[k]; return IsNumber(v) ? ((int)v)!=0 : def; }
     static inline String VS(ValueMap m, const char* k, const String& def) { Value v = m[k]; return IsString(v) ? (String)v : def; }
 
+	ValueMap ShapeToVM(const Shape& s) const {
+	    ValueMap m;
+	    m.Add("type", (int)s.type);
+	    m.Add("style", StyleToVM(s.style));
+	
+	    switch(s.type) {
+	        case PType::Rect:
+	            m.Add("x", s.x);  m.Add("y", s.y);
+	            m.Add("w", s.w);  m.Add("h", s.h);
+	            m.Add("rxN", s.rxN);
+	            m.Add("ryN", s.ryN);
+	            break;
+	
+	        case PType::Circle:
+	            m.Add("cx", s.cx); m.Add("cy", s.cy); m.Add("r", s.r);
+	            break;
+	
+	        case PType::Line:
+	            m.Add("p1x", s.p1.x); m.Add("p1y", s.p1.y);
+	            m.Add("p2x", s.p2.x); m.Add("p2y", s.p2.y);
+	            break;
+	
+	        case PType::Triangle:
+	            m.Add("p1x", s.p1.x); m.Add("p1y", s.p1.y);
+	            m.Add("p2x", s.p2.x); m.Add("p2y", s.p2.y);
+	            m.Add("p3x", s.p3.x); m.Add("p3y", s.p3.y);
+	            break;
+	
+	        case PType::Text:
+	            m.Add("x", s.x); m.Add("y", s.y);
+	            m.Add("txt",   s.text.text);
+	            m.Add("face",  s.text.face);
+	            m.Add("sizeN", s.text.sizeN);
+	            m.Add("bold",  (int)s.text.bold);
+	            m.Add("italic",(int)s.text.italic);
+	            break;
+	
+	        case PType::Curve:
+	            m.Add("cubic",  (int)s.curve.cubic);
+	            m.Add("closed", (int)s.curve.closed);
+	            m.Add("a0x", s.curve.a0.x); m.Add("a0y", s.curve.a0.y);
+	            m.Add("a1x", s.curve.a1.x); m.Add("a1y", s.curve.a1.y);
+	            m.Add("c0x", s.curve.c0.x); m.Add("c0y", s.curve.c0.y);
+	            m.Add("c1x", s.curve.c1.x); m.Add("c1y", s.curve.c1.y);
+	            break;
+	    }
+	    return m;
+	}
+
     ValueMap StyleToVM(const ::Style& s) const {
         ValueMap m;
         m("fill_r", s.fill.GetR())("fill_g", s.fill.GetG())("fill_b", s.fill.GetB())
@@ -1501,54 +1667,56 @@ struct Canvas : Ctrl {
         s.outlineOffsetY  = VI(m,"outlineOffsetY",0);
     }
 
-    String SaveJson() const {
-        ValueMap root;
-        root("snap", snap)("clip", clip)("grid", grid)("aspect_ix", aspect_ix)
-            ("clip_scale_n", clip_scale_n)
-            ("bg_r", bg_color.GetR())("bg_g", bg_color.GetG())("bg_b", bg_color.GetB())
-            ("text_template", text_template);
 
-        ValueArray a;
-        for(const Shape& s : shapes) {
-            ValueMap sh;
-            sh("type", (int)s.type)("style", StyleToVM(s.style));
-            switch(s.type) {
-                case PType::Rect:     sh("x", s.x)("y", s.y)("w", s.w)("h", s.h); break;
-                case PType::Circle:   sh("cx", s.cx)("cy", s.cy)("r", s.r); break;
-                case PType::Line:     sh("p1x", s.p1.x)("p1y", s.p1.y)("p2x", s.p2.x)("p2y", s.p2.y); break;
-                case PType::Triangle: sh("p1x", s.p1.x)("p1y", s.p1.y)("p2x", s.p2.x)("p2y", s.p2.y)
-                                           ("p3x", s.p3.x)("p3y", s.p3.y); break;
-                case PType::Text:     sh("x", s.x)("y", s.y)("txt", s.text.text)("face", s.text.face)
-                                           ("sizeN", s.text.sizeN)("bold", s.text.bold)("italic", s.text.italic); break;
-                case PType::Curve:    sh("cubic", s.curve.cubic)("closed", s.curve.closed)
-                                           ("a0x", s.curve.a0.x)("a0y", s.curve.a0.y)
-                                           ("a1x", s.curve.a1.x)("a1y", s.curve.a1.y)
-                                           ("c0x", s.curve.c0.x)("c0y", s.curve.c0.y)
-                                           ("c1x", s.curve.c1.x)("c1y", s.curve.c1.y); break;
-            }
-            a.Add(sh);
-        }
-        root("shapes", a);
-        return StoreAsJson(root, true); // pretty
-    }
+	String SaveJson() const {
+	    ValueMap root;
+	    root.Add("snap", snap);
+	    root.Add("clip", clip);
+	    root.Add("grid", grid);
+	    root.Add("aspect_ix", aspect_ix);
+	    root.Add("clip_scale_n", clip_scale_n);
+	    root.Add("bg_enabled", bg_enabled);
+	    root.Add("bg_r", bg_color.GetR());
+	    root.Add("bg_g", bg_color.GetG());
+	    root.Add("bg_b", bg_color.GetB());
+	    root.Add("text_template", text_template);
+	
+	    // shapes → ValueArray of ValueMap
+	    Vector<Value> arr;
+	    arr.Reserve(shapes.GetCount());
+	    for(const Shape& s : shapes)
+	        arr.Add(ShapeToVM(s));           // your existing per-shape -> ValueMap
+	    root.Add("shapes", ValueArray(pick(arr)));
+	
+	    // Compact JSON; if you want pretty, call AsJSON(root, true)
+	    return AsJSON(root);
+	}
+	
 
     void LoadJson(const String& js) {
-        Value v = ParseJSON(~js);      // JSON APIs in U++ Core  :contentReference[oaicite:3]{index=3}  :contentReference[oaicite:4]{index=4}
-        if(IsNull(v)) { Refresh(); return; }
-
-        ValueMap root;
-        if(IsValueMap(v)) root = v;
-        else if(IsPairArrayValueMap(v)) root = PairArrayToMap(ValueArray(v));
-        else { Refresh(); return; }
+	    Value v = ParseJSON(~js);
+	    if(IsNull(v)) { Refresh(); return; }
+	
+	    ValueMap root;
+	    if(IsValueMap(v)) {
+	        root = v;
+	    } else if(IsPairArrayValueMap(v)) {
+	        root = PairArrayToMap(ValueArray(v));   // <- flatten
+	    } else {
+	        Refresh();
+	        return;
+	    }
 
         snap         = VB(root, "snap", true);
         clip         = VB(root, "clip", true);
         grid         = VI(root, "grid", 8);
         aspect_ix    = VI(root, "aspect_ix", 0);
         clip_scale_n = VD(root, "clip_scale_n", 0.80);
+        bg_enabled = VB(root, "bg_enabled", true);
         bg_color     = Color(VI(root,"bg_r", SColorFace().GetR()),
                              VI(root,"bg_g", SColorFace().GetG()),
                              VI(root,"bg_b", SColorFace().GetB()));
+                             
         text_template = VS(root, "text_template", "Text");
 
         shapes.Clear();
@@ -1564,11 +1732,13 @@ struct Canvas : Ctrl {
             if(IsValueMap(stv)) StyleFrom(s.style, ValueMap(stv));
 
             switch(s.type) {
-                case PType::Rect:
-                    s.x = VD(sh, "x", 0); s.y = VD(sh, "y", 0);
-                    s.w = VD(sh, "w", 0); s.h = VD(sh, "h", 0);
-                    break;
-                case PType::Circle:
+				 case PType::Rect:
+				    s.x = VD(sh, "x", 0); s.y = VD(sh, "y", 0);
+				    s.w = VD(sh, "w", 0); s.h = VD(sh, "h", 0);
+				    s.rxN = VD(sh, "rxN", 0.0);  // << Curved rectangle
+				    s.ryN = VD(sh, "ryN", 0.0);  // << Curved rectangle
+				    break;
+				 case PType::Circle:
                     s.cx = VD(sh, "cx", 0); s.cy = VD(sh, "cy", 0); s.r = VD(sh, "r", 0);
                     break;
                 case PType::Line:
@@ -1611,6 +1781,8 @@ struct Canvas : Ctrl {
 struct MainWin : TopWindow {
     typedef MainWin CLASSNAME;
 
+	bool ui_syncing = false;   // guard for Radius spinner
+    
     // Layout
     Splitter   split;
     ParentCtrl left, right;
@@ -1626,10 +1798,13 @@ struct MainWin : TopWindow {
     Label  lblGrid, lblAspect, lblSample, lblSel;
     EditInt edGrid;
     DropList dlAspect, dlSampleRes;
+    Label  lblExportSize;
+    DropList dlExportSize;   // 32 / 64 / 128 / 256 / 512
+
 
     // Actions row
-    Button bDup, bUndo, bRedo, bFlipX, bFlipY, bReset, bDelete, bLayerUp, bLayerDown, bLoad,
-           bSave, bBg, bClear;
+    Button bDup, bUndo, bRedo, bFlipX, bFlipY, bReset, bDelete, bLayerUp, bLayerDown, 
+            bBg, bClear;
     ColorPusher cBg;
 
     // Style row widgets
@@ -1640,6 +1815,9 @@ struct MainWin : TopWindow {
     EditIntSpin esOutlineOffX, esOutlineOffY;
     EditString  edDash, edOutlineDash;
     DropList    dlStrokeType, dlOutlineType;
+    
+    Label lblRectRadius; //Curved rectangle
+    EditIntSpin spinRectRx, spinRectRy;
 
     // Per-channel opacity sliders
     SliderCtrl sFillOpacity, sStrokeOpacity, sOutlineOpacity;
@@ -1658,26 +1836,59 @@ struct MainWin : TopWindow {
     StaticRect  codeHdr;
     ParentCtrl  codeHdrBox;
     Label       codeTitle;
-    Button      bCopy;
+    Button      bCopy,bLoad,bSave;
     DocEdit     code;
 
     // Canvas
     Canvas canvas;
 
     // ------------------- helpers -------------------
-    void UpdateCode() {
-        String out;
-        out << "void DrawIcon(Draw& w, const Rect& inset)\n{\n";
-        out << "    BufferPainter p(w, MODE_ANTIALIASED);\n\n";
-        for(const Shape& s : canvas.shapes)
-            GetOps(s.type).EmitCode(out, s);
-        out << "}\n";
-        code <<= out;
+void UpdateCode() {
+    const Canvas::Aspect a = canvas.ASPECTS[canvas.aspect_ix];
+    const int W = canvas.export_width;
+    const int H = int(double(W) * a.h / a.w + 0.5);
+
+    String out;
+
+    // The generated function expects X/Y/R(inset, …) helpers to exist in scope,
+    // If your destination file doesn’t already have them, include:
+    //   static inline int X(const Rect& r,double nx){return r.left+int(r.Width()*nx+0.5);}
+    //   static inline int Y(const Rect& r,double ny){return r.top +int(r.Height()*ny+0.5);}
+    //   static inline int R(const Rect& r,double nr){return int(min(r.Width(),r.Height())*nr+0.5);}
+
+    out << "void DrawIcon(Draw& w, const Rect& inset)\n{\n";
+    out << "    BufferPainter p(w, MODE_ANTIALIASED);\n\n";
+
+    // Optional background fill, mapped to the full inset.
+    if(canvas.bg_enabled) {
+        const Color c = canvas.bg_color;
+        out << "    p.Begin();\n";
+        out << "    p.Move(Pointf(inset.left,  inset.top));\n";
+        out << "    p.Line(Pointf(inset.right, inset.top));\n";
+        out << "    p.Line(Pointf(inset.right, inset.bottom));\n";
+        out << "    p.Line(Pointf(inset.left,  inset.bottom));\n";
+        out << "    p.Close();\n";
+        out << "    p.Fill(Color(" << c.GetR() << "," << c.GetG() << "," << c.GetB() << "));\n";
+        out << "    p.End();\n\n";
     }
+
+    // Emit per-primitive BufferPainter code using normalized coordinates.
+    for(const Shape& s : canvas.shapes)
+        GetOps(s.type).EmitCode(out, s);
+
+    out << "}\n";
+
+    code <<= out;
+}
+
+
 
     void PushStyleToUI() {
         if(canvas.selected < 0 || canvas.selected >= canvas.shapes.GetCount()) return;
+        ui_syncing = true;   // <— guard ON
+          
         const ::Style& st = canvas.shapes[canvas.selected].style;
+        const Shape& sh = canvas.shapes[canvas.selected];
 
         cbFill       = st.enableFill;
         cbStroke     = st.enableStroke;
@@ -1700,11 +1911,29 @@ struct MainWin : TopWindow {
         dlStrokeType.SetIndex(ToI(st.strokeStyle));
         dlOutlineType.SetIndex(ToI(st.outlineStyle));
 
-        edDash        <<= st.dash;
-        edOutlineDash <<= st.outlineDash;
+        edDash        <<= DashFrom(st.strokeStyle,  st.dash);
+        edOutlineDash <<= DashFrom(st.outlineStyle, st.outlineDash);
 
         esOutlineOffX <<= st.outlineOffsetX;
         esOutlineOffY <<= st.outlineOffsetY;
+        
+         // Rect radii (px preview of normalized)
+	    const Rect ir = canvas.GetInsetRect();
+	    const int base = min(ir.Width(), ir.Height());
+	    const bool isRect = (sh.type == PType::Rect);
+	    
+	    const Rect IconSize(0,0,64,64); 
+	    
+	    spinRectRx.Enable(isRect);
+	    spinRectRy.Enable(isRect);
+	    if(isRect) {
+	        spinRectRx <<= max(0, int(sh.rxN * base + 0.5));
+	        spinRectRy <<= max(0, int(sh.ryN * base + 0.5));
+	    } else {
+	        spinRectRx <<= 0;
+	        spinRectRy <<= 0;
+	    }
+        
 
         // If Text selected: mirror text & font selection
         if(canvas.shapes[canvas.selected].type == PType::Text) {
@@ -1720,9 +1949,12 @@ struct MainWin : TopWindow {
             cbItalic = td.italic;
             MirrorTextUIFromSelection();
         }
+        ui_syncing = false;  // <— guard OFF
+
     }
 
     void PullStyleFromUI() {
+        if(ui_syncing) return;            // <-- prevents re-entrancy glitches
         if(canvas.selected < 0 || canvas.selected >= canvas.shapes.GetCount()) return;
         ::Style& st = canvas.shapes[canvas.selected].style;
 
@@ -1745,11 +1977,42 @@ struct MainWin : TopWindow {
         st.strokeStyle = FromI(dlStrokeType.GetIndex());
         st.outlineStyle= FromI(dlOutlineType.GetIndex());
 
-        st.dash        = ~edDash;
-        st.outlineDash = ~edOutlineDash;
+		// Stroke dash (text box rules)
+		st.dash = ~edDash;
+		st.strokeStyle = GuessStyleFromString(st.dash);
+		dlStrokeType.SetIndex(ToI(st.strokeStyle));
+		
+		// Outline dash (text box rules)
+		st.outlineDash = ~edOutlineDash;
+		st.outlineStyle = GuessStyleFromString(st.outlineDash);
+		dlOutlineType.SetIndex(ToI(st.outlineStyle));
 
         st.outlineOffsetX = (int)~esOutlineOffX;
         st.outlineOffsetY = (int)~esOutlineOffY;
+
+		// Rect radii
+		Shape& sh = canvas.shapes[canvas.selected];
+		if(sh.type == PType::Rect) {
+		    const Rect ir = canvas.GetInsetRect();
+		    const int base = max(1, min(ir.Width(), ir.Height()));
+		    int rxpx = (int)~spinRectRx;
+		    int rypx = (int)~spinRectRy;
+		
+		    // Clamp to half-edges of current rect (in px)
+		    Rect rpx(
+		        Canvas::X(ir, sh.x),
+		        Canvas::Y(ir, sh.y),
+		        Canvas::X(ir, sh.x + sh.w) - Canvas::X(ir, sh.x),
+		        Canvas::Y(ir, sh.y + sh.h) - Canvas::Y(ir, sh.y)
+		    );
+		    rpx.Normalize();
+		    rxpx = min(rxpx, rpx.Width()  / 2);
+		    rypx = min(rypx, rpx.Height() / 2);
+		
+		    sh.rxN = Upp::clamp(rxpx / double(base), 0.0, 1.0);
+		    sh.ryN = Upp::clamp(rypx / double(base), 0.0, 1.0);
+		}
+
 
         canvas.Refresh();
         UpdateCode();
@@ -1850,8 +2113,8 @@ struct MainWin : TopWindow {
 		left.Add(rowTools.TopPos(0, 40).HSizePos());
 		left.Add(rowOps.TopPos(40, 28).HSizePos());
 		left.Add(rowActions.TopPos(68, 32).HSizePos());
-		left.Add(rowStyle.TopPos(100, 168).HSizePos());
-		left.Add(rowCanvas.VSizePos(268, 0).HSizePos());
+		left.Add(rowStyle.TopPos(100, 120).HSizePos());
+		left.Add(rowCanvas.VSizePos(220, 0).HSizePos());
 
 		// Tools
 		rowTools.SetFrame(ThinInsetFrame());
@@ -1866,18 +2129,7 @@ struct MainWin : TopWindow {
 		for(int i = 0; i < Canvas::ASPECT_COUNT; ++i)
 			dlAspect.Add(i, Canvas::ASPECTS[i].label);
 		dlAspect.SetIndex(canvas.aspect_ix);
-
-		dlSampleRes.Add(32, "32");
-		dlSampleRes.Add(64, "64");
-		dlSampleRes.Add(128, "128");
-		dlSampleRes.Add(512, "512");
-		dlSampleRes.SetData(canvas.sample_width);
-
-		int y = 3, h = 24;
-		//int  xbtn = 6;;
-		colStart = 3;
-		colPad = 6;
-		rowPad = 3;
+		
 		
 		colX = colStart;
 
@@ -1889,26 +2141,48 @@ struct MainWin : TopWindow {
 
 	   // BG toggle  + color pusher (member)
 		cbBgEnable.SetLabel("Bg Color");
-		cbBgEnable <<= true;
+		cbBgEnable <<= canvas.bg_enabled;
 		rowOps.Add(cbBgEnable.LeftPos(ColPos(60), 50).VCenterPos());
 
 		cBg <<= Color(250, 250, 250);
 		rowOps.Add(cBg.LeftPos(ColPos(50), 40).VCenterPos());
 
 		lblAspect.SetText("Aspect Ratio");
-		rowOps.Add(lblAspect.LeftPos(ColPos(70), 80).VCenterPos());
+		rowOps.Add(lblAspect.LeftPos(ColPos(70), 70).VCenterPos());
 		rowOps.Add(dlAspect.LeftPos(ColPos(60), 60).VCenterPos());
 
-		lblSample.SetText("SampleRes");
-		rowOps.Add(lblSample.LeftPos(ColPos(60), 70).VCenterPos());
+		lblSample.SetText("Preview");
+		dlSampleRes.Add(0, "None");
+		dlSampleRes.Add(32, "32");
+		dlSampleRes.Add(64, "64");
+		dlSampleRes.Add(128, "128");
+
+		dlSampleRes.SetData(canvas.sample_width);
+		rowOps.Add(lblSample.LeftPos(ColPos(40), 40).VCenterPos());
 		rowOps.Add(dlSampleRes.LeftPos(ColPos(60), 60).VCenterPos());
+
+	    lblExportSize.SetText("Export");
+		dlExportSize.Add(32,  "32");
+		dlExportSize.Add(64,  "64");
+		dlExportSize.Add(128, "128");
+		dlExportSize.Add(256, "256");
+		dlExportSize.Add(512, "512");
+		
+		rowOps.Add(lblExportSize.LeftPos(ColPos(40), 40).VCenterPos());
+		rowOps.Add(dlExportSize.LeftPos(ColPos(60), 60).VCenterPos());
+		
+		dlExportSize.SetData(canvas.export_width);
+		dlExportSize.WhenAction = [=]{
+    		canvas.export_width = (int)dlExportSize.GetData();
+    		UpdateCode();
+			};
 
 		cbShowGrid.SetLabel("Grid");
 		cbShowGrid <<= true;
 		rowOps.Add(cbShowGrid.LeftPos(ColPos(40), 40).VCenterPos());
 
 		lblGrid.SetText("Step");
-		rowOps.Add(lblGrid.LeftPos(ColPos(40), 40).VCenterPos());
+		rowOps.Add(lblGrid.LeftPos(ColPos(30), 30).VCenterPos());
 		edGrid.MinMax(2, 64);
 		rowOps.Add(edGrid.LeftPos(ColPos(60), 60).VCenterPos());
 	    
@@ -1948,8 +2222,9 @@ struct MainWin : TopWindow {
 		rowStyle.SetFrame(ThinInsetFrame());
 
 		// Row 1: Fill
-		y = 3;
-		colX = colStart;
+		int y = 3, h = 24;
+		
+
 		cbFill.SetLabel("Fill");
 		rowStyle.Add(cbFill.LeftPos(ColPos(60, true), 60).TopPos(y, h));
 		rowStyle.Add(cFill.LeftPos(ColPos(40), 40).TopPos(y, h));
@@ -1985,7 +2260,7 @@ struct MainWin : TopWindow {
 		rowStyle.Add(spinStrokeW.LeftPos(ColPos(60), 60).TopPos(y, h));
 
 		lblStType.SetText("Type");
-		rowStyle.Add(lblStType.LeftPos(ColPos(40), 40).TopPos(y, h));
+		rowStyle.Add(lblStType.LeftPos(ColPos(30), 30).TopPos(y, h));
 		dlStrokeType.Clear();
 		dlStrokeType.Add("Solid");
 		dlStrokeType.Add("LongDash");
@@ -1994,12 +2269,18 @@ struct MainWin : TopWindow {
 		dlStrokeType <<= 0;
 		rowStyle.Add(dlStrokeType.LeftPos(ColPos(80), 80).TopPos(y, h));
 
-
-
 		lblStDash.SetText("Dash");
-		rowStyle.Add(lblStDash.LeftPos(ColPos(40), 40).TopPos(y, h));
+		rowStyle.Add(lblStDash.LeftPos(ColPos(30), 30).TopPos(y, h));
 		rowStyle.Add(edDash.LeftPos(ColPos(60), 60).TopPos(y, h)); // MEMBER
 
+    
+    	lblRectRadius.SetText("Radius X/Y");
+    	spinRectRx.MinMax(0, 100);
+        spinRectRy.MinMax(0, 100);
+		rowStyle.Add(lblRectRadius.LeftPos(ColPos(60), 60).TopPos(y, h));
+		rowStyle.Add(spinRectRx.LeftPos(ColPos(45), 45).TopPos(y, h));
+		rowStyle.Add(spinRectRy.LeftPos(ColPos(45), 45).TopPos(y, h)); 
+		
 		y += h + rowPad;
 
 		// Row 3: Outline
@@ -2022,7 +2303,7 @@ struct MainWin : TopWindow {
 		rowStyle.Add(spinOutlineW.LeftPos(ColPos(60), 60).TopPos(y, h));
 
 		lblOlType.SetText("Type");
-		rowStyle.Add(lblOlType.LeftPos(ColPos(40), 40).TopPos(y, h));
+		rowStyle.Add(lblOlType.LeftPos(ColPos(30), 30).TopPos(y, h));
 		dlOutlineType.Clear();
 		dlOutlineType.Add("Solid");
 		dlOutlineType.Add("LongDash");
@@ -2033,13 +2314,13 @@ struct MainWin : TopWindow {
 
 
 		lblOlDash.SetText("Dash");
-		rowStyle.Add(lblOlDash.LeftPos(ColPos(40), 40).TopPos(y, h));
+		rowStyle.Add(lblOlDash.LeftPos(ColPos(30), 30).TopPos(y, h));
 		rowStyle.Add(edOutlineDash.LeftPos(ColPos(60), 60).TopPos(y, h)); 
 
-		lblOff.SetText("OffX/Y");
-		rowStyle.Add(lblOff.LeftPos(ColPos(50), 50).TopPos(y, h));
-		rowStyle.Add(esOutlineOffX.LeftPos(ColPos(50), 50).TopPos(y, h));
-		rowStyle.Add(esOutlineOffY.LeftPos(ColPos(50), 50).TopPos(y, h)); 
+		lblOff.SetText("Offset X/Y");
+		rowStyle.Add(lblOff.LeftPos(ColPos(60), 60).TopPos(y, h));
+		rowStyle.Add(esOutlineOffX.LeftPos(ColPos(45), 45).TopPos(y, h));
+		rowStyle.Add(esOutlineOffY.LeftPos(ColPos(45), 45).TopPos(y, h)); 
 
 		y += h + rowPad;
 
@@ -2061,6 +2342,22 @@ struct MainWin : TopWindow {
 		rowStyle.Add(cbBold.LeftPos(ColPos(40), 40).TopPos(y, h));
 		rowStyle.Add(cbItalic.LeftPos(ColPos(40), 40).TopPos(y, h));
 
+	    ::Style def; // default ctor values (fill=163,201,168; stroke=30,53,47; etc.)
+	    // toggles
+	    cbFill       = def.enableFill;
+	    cbStroke     = def.enableStroke;
+	    cbEvenOdd    = def.evenOdd;
+	    cbOutline    = def.outlineEnable;// colors
+	    cFill        <<= def.fill;
+	    cStroke      <<= def.stroke;
+	    cOutline     <<= def.outlineColor;
+	    // dash/style presets
+	    dlStrokeType.SetIndex(ToI(def.strokeStyle));
+	    dlOutlineType.SetIndex(ToI(def.outlineStyle));
+	    edDash        <<= def.dash;
+	    edOutlineDash <<= def.outlineDash;
+	    
+	    
 		// Fonts
 		LoadSystemFonts();
 
@@ -2139,16 +2436,22 @@ struct MainWin : TopWindow {
 				UpdateCode();
 		};
 
-		// BG wiring (members; safe captures)
-		cbBgEnable.WhenAction = [this] {
-			canvas.bg_color = (bool)~cbBgEnable ? (Color)~cBg : White();
-			canvas.Refresh();
+	   // BG wiring (members; safe captures)
+		cbBgEnable <<= false;
+		cBg        <<= Color(250,250,250);
+		
+		cbBgEnable.WhenAction = [this]{
+		    canvas.bg_enabled = (bool)~cbBgEnable;
+		    if(canvas.bg_enabled) canvas.bg_color = (Color)~cBg;
+		    canvas.Refresh();
+		    UpdateCode();
 		};
-		cBg.WhenAction = [this] {
-			if((bool)~cbBgEnable) {
-				canvas.bg_color = (Color)~cBg;
-				canvas.Refresh();
-			}
+		cBg.WhenAction = [this]{
+		    if(canvas.bg_enabled){
+		        canvas.bg_color = (Color)~cBg;
+		        canvas.Refresh();
+		        UpdateCode();
+		    }
 		};
 
 		// Ops wiring
@@ -2186,28 +2489,29 @@ struct MainWin : TopWindow {
 		edOutlineDash.WhenAction = THISBACK(PullStyleFromUI);
 		esOutlineOffX.WhenAction = THISBACK(PullStyleFromUI);
 		esOutlineOffY.WhenAction = THISBACK(PullStyleFromUI);
+		spinRectRx.WhenAction = THISBACK(PullStyleFromUI);
+        spinRectRy.WhenAction = THISBACK(PullStyleFromUI);
 
 		// Dash presets
 		dlStrokeType.WhenAction = [this] {
-			if(canvas.selected < 0 || canvas.selected >= canvas.shapes.GetCount())
-				return;
-			::Style& st = canvas.shapes[canvas.selected].style;
-			st.strokeStyle = FromI(dlStrokeType.GetIndex());
-			String d = DashFrom(st.strokeStyle, String());
-			if(!d.IsEmpty())
-				edDash <<= d;
-			PullStyleFromUI();
+		    if(canvas.selected < 0 || canvas.selected >= canvas.shapes.GetCount()) return;
+		    ::Style& st = canvas.shapes[canvas.selected].style;
+		    st.strokeStyle = FromI(dlStrokeType.GetIndex());
+		    String d = DashFrom(st.strokeStyle, String());
+		    edDash <<= d;                 // echo (Solid => empty)
+		    st.dash = d;                  // keep model consistent
+		    PullStyleFromUI();
 		};
 		dlOutlineType.WhenAction = [this] {
-			if(canvas.selected < 0 || canvas.selected >= canvas.shapes.GetCount())
-				return;
-			::Style& st = canvas.shapes[canvas.selected].style;
-			st.outlineStyle = FromI(dlOutlineType.GetIndex());
-			String d = DashFrom(st.outlineStyle, String());
-			if(!d.IsEmpty())
-				edOutlineDash <<= d;
-			PullStyleFromUI();
+		    if(canvas.selected < 0 || canvas.selected >= canvas.shapes.GetCount()) return;
+		    ::Style& st = canvas.shapes[canvas.selected].style;
+		    st.outlineStyle = FromI(dlOutlineType.GetIndex());
+		    String d = DashFrom(st.outlineStyle, String());
+		    edOutlineDash <<= d;          // echo
+		    st.outlineDash = d;
+		    PullStyleFromUI();
 		};
+
 
 		// Text wiring (with debounce for Codes)
 		auto text_to_codes = [](const String& s) -> String {
@@ -2338,5 +2642,4 @@ GUI_APP_MAIN
 	SetDefaultCharset(CHARSET_UTF8);
 	MainWin().Run();
 }
-
 
