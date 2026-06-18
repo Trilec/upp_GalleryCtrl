@@ -933,9 +933,54 @@ static void DrawMyIcon(BufferPainter& p, const Rect& inset)
 
 }
 
+
+static void s_draw_mountains(BufferPainter& p, const Rect& inset, Color back_mtn, Color front_mtn, Color sun)
+{
+     // Rect
+    p.Begin();
+    p.Move(Point((int)(inset.left  + inset.Width()  * 0.0649), (int)(inset.top   + inset.Height() * 0.0649)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.9347), (int)(inset.top   + inset.Height() * 0.0649)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.9347), (int)(inset.top   + inset.Height() * 0.9347)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.0649), (int)(inset.top   + inset.Height() * 0.9347)));
+    p.Close();
+    p.Stroke(28, Color(63,63,63));
+    p.End();
+    
+   // Triangle
+    p.Begin();
+    p.Move(Point((int)(inset.left  + inset.Width()  * 0.3283), (int)(inset.top   + inset.Height() * 0.3476)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.0432), (int)(inset.top   + inset.Height() * 0.6919)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.8069), (int)(inset.top   + inset.Height() * 0.9614)));
+    p.Close();
+    p.Fill(Color(63,63,63));
+    p.End();
+
+    // Triangle
+    p.Begin();
+    p.Move(Point((int)(inset.left  + inset.Width()  * 0.6695), (int)(inset.top   + inset.Height() * 0.4807)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.1545), (int)(inset.top   + inset.Height() * 0.9442)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.9514), (int)(inset.top   + inset.Height() * 0.8000)));
+    p.Close();
+    p.Fill(Color(63,63,63));
+    p.End();
+
+    // Circle
+    p.Begin();
+    p.Circle((int)(inset.left  + inset.Width()  * 0.6223), (int)(inset.top   + inset.Height() * 0.2768), (int)(min(inset.Width(), inset.Height()) * 0.1044));
+    p.Fill(Color(63,63,63));
+    p.End();
+
+    // Line
+    p.Begin();
+    p.Move(Point((int)(inset.left  + inset.Width()  * 0.0865), (int)(inset.top   + inset.Height() * 0.8000)));
+    p.Line(Point((int)(inset.left  + inset.Width()  * 0.9081), (int)(inset.top   + inset.Height() * 0.8216)));
+    p.Stroke(74, Color(63,63,63));
+    p.End();
+
+}
+/*
 // Shared: two mountains + sun
-static void s_draw_mountains(BufferPainter& p, const Rect& inset,
-                             Color back_mtn, Color front_mtn, Color sun)
+static void s_draw_mountains(BufferPainter& p, const Rect& inset, Color back_mtn, Color front_mtn, Color sun)
 {
     // Triangle
     // Circle
@@ -970,7 +1015,7 @@ static void s_draw_mountains(BufferPainter& p, const Rect& inset,
     p.Fill( front_mtn );
     p.Clip();
 }
-
+*/
 const Image& GalleryCtrl::Glyph(GlyphType type, int tile)
 {
     static VectorMap<int, Image> cache; // key = (type<<16) | size
